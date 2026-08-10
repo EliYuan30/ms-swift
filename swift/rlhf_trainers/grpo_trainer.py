@@ -51,7 +51,7 @@ from swift.dataset import RowPreprocessor
 from swift.rewards import orms, rm_plugins
 from swift.rl_core.advantage import (apply_rlsd_reweight, compute_advantages, compute_advantages_dynamic,
                                      compute_reward_metrics, compute_sdar_loss, compute_teacher_kl_per_token,
-                                     expand_advantage_to_per_token)
+                                     compute_teacher_logratio, expand_advantage_to_per_token)
 from swift.rl_core.data import GRPOBatch, GRPOSample
 from swift.rl_core.grpo_algorithm import score_completions
 from swift.rlhf_trainers.gkd_helpers import (assemble_teacher_completion_logprobs, build_opsd_samples,
@@ -123,6 +123,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # functions it is the sole signal. Same gating as GKD: teacher set -> teacher branch.
         self._setup_teacher()
         self.teacher_kl_coef = args.teacher_kl_coef
+        self.mopd_advantage_clip = args.mopd_advantage_clip
+        self.mopd_branch_loss_coef = args.mopd_branch_loss_coef
         if not self.reward_funcs and not self.use_gym_env and not self._has_teacher:
             raise ValueError('You must specify reward_funcs or reward_model')
 
@@ -291,14 +293,19 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 # Expand the per-sequence base advantage to per-token [B, T] here (not by broadcast
                 # in the loss), so the OPD-RL signed teacher log-ratio is added per token
                 # (adv_t = base + coef * (teacher_logp - student_logp)).
-                grpo_batch.advantages = expand_advantage_to_per_token(
-                    base_advantages,
-                    grpo_batch.completion_mask,
-                    teacher_per_token_logps=grpo_batch.teacher_per_token_logps,
-                    policy_per_token_logps=grpo_batch.old_per_token_logps
-                    if grpo_batch.teacher_per_token_logps is not None else None,
-                    teacher_kl_coef=self.teacher_kl_coef if grpo_batch.teacher_per_token_logps is not None else 0.0,
-                )
+                grpo_batch.advantages = expand_advantage_to_per_token(base_advantages, grpo_batch.completion_mask)
+                if grpo_batch.teacher_per_token_logps is not None:
+                    teacher_delta = compute_teacher_logratio(
+                        grpo_batch.teacher_per_token_logps,
+                        grpo_batch.old_per_token_logps,
+                        grpo_batch.completion_mask,
+                    )
+                    if self.mopd_advantage_clip is not None:
+                        clip = float(self.mopd_advantage_clip)
+                        teacher_delta = teacher_delta.clamp(min=-clip, max=clip)
+                    grpo_batch.advantages = grpo_batch.advantages + self.teacher_kl_coef * teacher_delta
+            if grpo_batch.branch_token_mask is not None:
+                grpo_batch.advantages = grpo_batch.advantages.masked_fill(grpo_batch.branch_token_mask, 0.0)
             if grpo_batch.teacher_per_token_logps is not None:
                 mode = 'train' if self.model.training else 'eval'
                 # Monitoring uses the non-negative k3 estimator (a "distance from the teacher" gauge
@@ -599,8 +606,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         token, not the top-1) as a completion-frame ``TeacherOutput``, then read its single
         column as ``teacher_per_token_logps``. Future top-k RL reuses the same ``TeacherOutput``.
 
-        Each sample routes to exactly one teacher by tag (single teacher = all samples). Routing
-        runs once over the flattened batch, so a single teacher is one DP gather → infer → slice.
+        By default each sample routes to one teacher by tag. Utility MOPD may additionally provide
+        ``teacher_route_by_turn`` in rollout_infos; in that case every teacher scores the sampled
+        trajectory and the resulting logps are merged token by token.
 
         Samples/requests come from each chunk's ``_chunk_samples`` (the SP-gathered batch that its
         ``grpo_batch`` was collated from), not the local ``samples`` argument: under SP>1 the local
@@ -616,28 +624,84 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # OPSD: populate teacher_messages so build_teacher_requests scores the teacher prompt.
         build_opsd_samples(flat_samples)
         requests = build_teacher_requests(flat_samples, self.template)
-        parsed = fetch_teacher_parsed_by_routing(
-            flat_samples,
-            requests,
-            self.teacher_configs,
-            self.teacher_clients,
-            gather_fn=self._gather_teacher_requests,
-            infer_fn=lambda handle, client: self._infer_teacher_requests(handle, topk=0, teacher_client=client),
-            scatter_fn=self._scatter_teacher_parsed,
-            is_main_process=self.accelerator.is_main_process,
-            tag_key=self.args.teacher_tag_key)
+        token_routing = len(self.teacher_configs) > 1 and any(
+            (sample.rollout_infos or {}).get('teacher_route_by_turn') for sample in flat_samples)
+        if token_routing:
+            handles = [self._gather_teacher_requests(requests) for _ in self.teacher_configs]
+            parsed_globals = [None] * len(self.teacher_configs)
+            if self.accelerator.is_main_process:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=len(self.teacher_configs)) as pool:
+                    futures = {
+                        pool.submit(
+                            self._infer_teacher_requests,
+                            handle,
+                            0,
+                            self.teacher_clients[teacher_idx],
+                        ): teacher_idx
+                        for teacher_idx, handle in enumerate(handles)
+                    }
+                    for future, teacher_idx in futures.items():
+                        parsed_globals[teacher_idx] = future.result()
+            parsed_by_teacher = [
+                self._scatter_teacher_parsed(handle, parsed_globals[teacher_idx])
+                for teacher_idx, handle in enumerate(handles)
+            ]
+            route_to_teacher = {
+                tag: teacher_idx
+                for teacher_idx, config in enumerate(self.teacher_configs)
+                for tag in config.tags
+            }
+        else:
+            parsed = fetch_teacher_parsed_by_routing(
+                flat_samples,
+                requests,
+                self.teacher_configs,
+                self.teacher_clients,
+                gather_fn=self._gather_teacher_requests,
+                infer_fn=lambda handle, client: self._infer_teacher_requests(
+                    handle, topk=0, teacher_client=client),
+                scatter_fn=self._scatter_teacher_parsed,
+                is_main_process=self.accelerator.is_main_process,
+                tag_key=self.args.teacher_tag_key)
 
         offset = 0
         for batch_encoded, chunk in zip(batch_encoded_inputs, chunk_samples_list):
             grpo_batch: GRPOBatch = batch_encoded['grpo_batch']
             device = grpo_batch.completion_mask.device
             n = len(chunk)
-            teacher_out = assemble_teacher_completion_logprobs(
-                parsed[offset:offset + n],
-                grpo_batch.completion_mask,
-                device,
-                response_token_ids=[s.response_token_ids for s in chunk])
-            grpo_batch.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
+            if token_routing:
+                teacher_logps = []
+                for teacher_parsed in parsed_by_teacher:
+                    teacher_out = assemble_teacher_completion_logprobs(
+                        teacher_parsed[offset:offset + n],
+                        grpo_batch.completion_mask,
+                        device,
+                        response_token_ids=[s.response_token_ids for s in chunk])
+                    teacher_logps.append(teacher_out.topk_logprobs[..., 0])
+                merged = torch.zeros_like(teacher_logps[0])
+                for row, sample in enumerate(chunk):
+                    info = sample.rollout_infos or {}
+                    routes = [route for turn in info.get('teacher_route_by_turn', []) for route in turn]
+                    default_route = info.get('default_teacher_route') or sample.get_tag(self.args.teacher_tag_key)
+                    completion_indices = grpo_batch.completion_mask[row].nonzero(as_tuple=True)[0]
+                    routes = routes[:len(completion_indices)]
+                    routes.extend([default_route] * (len(completion_indices) - len(routes)))
+                    for token_index, route in zip(completion_indices, routes):
+                        teacher_idx = route_to_teacher.get(str(route))
+                        if teacher_idx is None:
+                            raise ValueError(
+                                f'No MOPD teacher is registered for token route {route!r}; '
+                                f'available routes: {sorted(route_to_teacher)}')
+                        merged[row, token_index] = teacher_logps[teacher_idx][row, token_index]
+                grpo_batch.teacher_per_token_logps = merged
+            else:
+                teacher_out = assemble_teacher_completion_logprobs(
+                    parsed[offset:offset + n],
+                    grpo_batch.completion_mask,
+                    device,
+                    response_token_ids=[s.response_token_ids for s in chunk])
+                grpo_batch.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
             offset += n
 
     @profiling_decorator
@@ -983,6 +1047,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             truncated_mask = truncated_mask.unsqueeze(-1).expand_as(completion_mask)
             completion_mask = completion_mask & (~truncated_mask)
 
+        branch_completion_mask = None
+        if grpo_batch.branch_token_mask is not None:
+            branch_completion_mask = grpo_batch.branch_token_mask.bool() & completion_mask
+            completion_mask = completion_mask & (~branch_completion_mask)
+
         per_token_kl = None
         if self.beta != 0.0 and not self.kl_in_reward:
             ref_per_token_logps = grpo_batch.ref_per_token_logps
@@ -1143,6 +1212,18 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             loss = (per_token_loss * completion_mask).sum() / normalizer
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
+
+        if self.mopd_branch_loss_coef > 0 and branch_completion_mask is not None:
+            branch_counts = branch_completion_mask.sum(-1)
+            active = branch_counts > 0
+            if active.any():
+                branch_nll = -(per_token_logps * branch_completion_mask).sum(-1) / branch_counts.clamp(min=1.0)
+                branch_loss = branch_nll[active].mean()
+                loss = loss + self.mopd_branch_loss_coef * branch_loss
+                self._metrics[mode]['mopd/branch_loss'].append(branch_loss.detach().item())
+                self._metrics[mode]['mopd/branch_token_ratio'].append(
+                    (branch_completion_mask.sum() / grpo_batch.completion_mask.sum().clamp(min=1.0)).item())
+                self._metrics[mode]['mopd/branch_loss_coef'].append(self.mopd_branch_loss_coef)
 
         # SDAR (Self-Distilled Agentic RL): confidence-gated teacher distillation auxiliary loss.
         # Added to the reduced GRPO policy loss (loss = policy_loss + sdar_loss_coef * L_SDAR),
@@ -2037,6 +2118,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                                  if grpo_batch.ref_per_token_logps is not None else None),
             rollout_per_token_logps=(grpo_batch.rollout_per_token_logps[start_idx:end_idx]
                                      if grpo_batch.rollout_per_token_logps is not None else None),
+            teacher_per_token_logps=(grpo_batch.teacher_per_token_logps[start_idx:end_idx]
+                                     if grpo_batch.teacher_per_token_logps is not None else None),
+            branch_token_mask=(grpo_batch.branch_token_mask[start_idx:end_idx]
+                               if grpo_batch.branch_token_mask is not None else None),
             advantages=grpo_batch.advantages[start_idx:end_idx] if grpo_batch.advantages is not None else None,
             num_items_in_batch=grpo_batch.num_items_in_batch,
             logits_to_keep=grpo_batch.logits_to_keep,

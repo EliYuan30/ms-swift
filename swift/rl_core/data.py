@@ -321,6 +321,7 @@ class GRPOBatch:
     ref_per_token_logps: Optional[torch.Tensor] = None  # [B, T]
     rollout_per_token_logps: Optional[torch.Tensor] = None  # [B, T]
     teacher_per_token_logps: Optional[torch.Tensor] = None  # [B, T], OPD-RL teacher logp on sampled tokens
+    branch_token_mask: Optional[torch.Tensor] = None  # [B, T], canonical branch tokens trained with NLL
     advantages: Optional[torch.Tensor] = None  # [B, T] per-token (base broadcast minus per-token teacher KL)
     num_items_in_batch: Optional[torch.Tensor] = None  # scalar
     logits_to_keep: Optional[int] = None

@@ -438,6 +438,10 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # OPD-RL (On-Policy Distillation as RL)
     # enabled when a teacher (teacher_model / teacher_model_server) is set on a GRPO run.
     teacher_kl_coef: float = 1.0
+    # Utility-gated branch-aware MOPD. Canonical branch tokens are excluded from
+    # sampled-token policy gradients and optimized by an explicit token NLL.
+    mopd_advantage_clip: Optional[float] = None
+    mopd_branch_loss_coef: float = 0.0
 
     # RLSD (Self-Distilled RLVR), https://arxiv.org/abs/2604.03128
     # Token-level advantage reweighting using the teacher-vs-student logprob gap. Reuses the OPSD

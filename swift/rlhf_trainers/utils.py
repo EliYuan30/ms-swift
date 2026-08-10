@@ -2004,6 +2004,26 @@ def build_rollout_logps(
     return rollout_per_token_logps
 
 
+def build_response_token_mask(
+    nested_masks: List[Optional[List[List[int]]]],
+    completion_mask: torch.Tensor,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Align scheduler-provided per-turn token masks to the completion frame."""
+    if not any(mask for mask in nested_masks):
+        return None
+    result = torch.zeros_like(completion_mask, dtype=torch.bool, device=device)
+    for row, nested in enumerate(nested_masks):
+        flat = [int(value) for turn in (nested or []) for value in turn]
+        completion_indices = completion_mask[row].nonzero(as_tuple=True)[0]
+        if len(flat) > len(completion_indices):
+            flat = flat[:len(completion_indices)]
+        if flat:
+            indices = completion_indices[:len(flat)]
+            result[row, indices] = torch.tensor(flat, dtype=torch.bool, device=device)
+    return result
+
+
 def _normalize_routed_experts_tensor(value: Any) -> torch.Tensor:
     routed = value.detach().cpu() if isinstance(value, torch.Tensor) else torch.as_tensor(value)
     if routed.dim() >= 4 and routed.shape[0] == 1:
@@ -2133,6 +2153,8 @@ def collate_to_grpo_micro_batch(
     )
     truncated_mask = torch.tensor([bool(s.is_truncated) for s in samples], dtype=torch.bool, device=device)
     rollout_per_token_logps = build_rollout_logps([s.rollout_logprobs for s in samples], completion_mask, device)
+    branch_token_mask = build_response_token_mask(
+        [(s.rollout_infos or {}).get('branch_response_mask') for s in samples], completion_mask, device)
 
     routed_experts = build_routed_experts_batch(
         samples,
@@ -2151,6 +2173,7 @@ def collate_to_grpo_micro_batch(
         truncated_mask=truncated_mask,
         seq_lengths=seq_lengths,
         rollout_per_token_logps=rollout_per_token_logps,
+        branch_token_mask=branch_token_mask,
         logits_to_keep=logits_to_keep,
     )
     return model_inputs, grpo_batch

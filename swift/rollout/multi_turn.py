@@ -325,6 +325,14 @@ class MultiTurnScheduler(RolloutScheduler, ABC):
                         total_response_loss_mask = [[1] * len(final_token_ids)]
                     if current_logprobs:
                         total_rollout_logprobs = [current_logprobs]
+                elif final_token_ids:
+                    # A normal multi-turn trajectory ends after a user/tool observation,
+                    # so the final assistant response is a new response segment rather
+                    # than a continuation of the preceding tool-call segment.
+                    total_response_ids.append(list(final_token_ids))
+                    total_response_loss_mask.append([1] * len(final_token_ids))
+                    if current_logprobs:
+                        total_rollout_logprobs.append(current_logprobs)
 
                 # Validate rollout_logprobs completeness: if logprobs are incomplete (missing for some turns),
                 # clear them to disable rollout importance sampling correction (which requires complete logprobs)

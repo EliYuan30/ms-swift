@@ -73,8 +73,9 @@ class InferRequest:
         audios (List[str]):
             Optional, a list of audio resources associated with the request.
 
-        videos (List[str]):
-            Optional, a list of video resources associated with the request.
+        videos (List[Union[str, List[str]]]):
+            Optional, a list of video resources. A video may be a path/URL or
+            a list of image paths representing pre-extracted frames.
 
         tools (Optional[List[Tool]]):
             An optional list of tools. These should be organized in the agent_template format for
@@ -87,7 +88,7 @@ class InferRequest:
 
     images: List[Union[str, Image.Image]] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
-    videos: List[str] = field(default_factory=list)
+    videos: List[Union[str, List[str]]] = field(default_factory=list)
 
     tools: Optional[List[Tool]] = None
     objects: Dict[str, Any] = field(default_factory=dict)
@@ -138,7 +139,7 @@ class RolloutInferRequest(InferRequest):
             Input conversation messages, supporting multimodal content.
         audios (List[str]):
             List of audio resources associated with the request.
-        videos (List[str]):
+        videos (List[Union[str, List[str]]]):
             List of video resources associated with the request.
         tools (Optional[List[Tool]]):
             List of tools, organized by the agent template (e.g. 'react_en').
