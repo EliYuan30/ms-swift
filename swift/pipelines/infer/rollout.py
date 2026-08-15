@@ -26,6 +26,7 @@ import traceback
 import uvicorn
 from aiohttp import ClientConnectorError
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict
 from fastapi import FastAPI
@@ -680,6 +681,17 @@ def llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int
 
 async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int,
                            connection: Connection) -> None:
+    loop = asyncio.get_running_loop()
+    max_workers = int(os.getenv('SWIFT_ROLLOUT_ENCODE_WORKERS', '0'))
+    if max_workers > 0:
+        loop.set_default_executor(
+            ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix='swift-rollout-encode',
+            )
+        )
+        logger.info(f"Async rollout encode workers: {max_workers}")
+
     try:
         args._import_external_plugins()
         os.environ['SWIFT_ROLLOUT_DP_RANK'] = str(data_parallel_rank)
@@ -692,7 +704,6 @@ async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, mast
         return
     connection.send({'status': 'ready'})
 
-    loop = asyncio.get_running_loop()
     while True:
         try:
             command = await loop.run_in_executor(None, connection.recv)
