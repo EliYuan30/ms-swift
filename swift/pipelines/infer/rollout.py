@@ -1002,25 +1002,7 @@ class SwiftRolloutDeploy(SwiftPipeline):
                     f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
                     f"{output['__swift_worker_error__']}"
                 )
-        for output in all_outputs:
-            if isinstance(output, dict) and '__swift_worker_error__' in output:
-                raise RuntimeError(
-                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
-                    f"{output['__swift_worker_error__']}"
-                )
-        for output in all_outputs:
-            if isinstance(output, dict) and '__swift_worker_error__' in output:
-                raise RuntimeError(
-                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
-                    f"{output['__swift_worker_error__']}"
-                )
-        for output in all_outputs:
-            if isinstance(output, dict) and '__swift_worker_error__' in output:
-                raise RuntimeError(
-                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
-                    f"{output['__swift_worker_error__']}"
-                )
-        # Handle empty prompts (see above)
+        success = all(output for output in all_outputs)
         return {'message': 'Request received, resetting prefix cache status: ' + str(success)}
 
     async def reset_encoder_cache(self):
