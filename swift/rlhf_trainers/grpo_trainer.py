@@ -28,6 +28,7 @@ except Exception:
 import concurrent.futures
 import inspect
 import os
+import statistics
 import time
 import torch
 import torch.distributed as dist
@@ -351,6 +352,21 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     if key not in self._logs:
                         self._logs[key] = deque(maxlen=self.args.generation_batch_size)
                     self._logs[key].extend(self._gather_and_flatten(value, flatten_level=0))
+
+            if not self.model.training and any('tool_metadata' in s.extra for s in samples):
+                from tool_rewards import tool_iou_metrics
+
+                local_metrics = [
+                    tool_iou_metrics(
+                        s.extra.get('tool_metadata'),
+                        (s.rollout_infos or {}).get('tool_calls', []),
+                    ) for s in samples
+                ]
+                for metric in gather_object(local_metrics):
+                    for tool_name in ('crop', 'select'):
+                        value = metric[tool_name]
+                        if value is not None:
+                            self._eval_tool_ious[tool_name].append(value)
 
     @profiling_decorator
     def _compute_rewards_per_func(self, samples: List[GRPOSample]) -> torch.Tensor:
@@ -1889,7 +1905,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 time.sleep(0.1)
         if self._queue.empty() and self.args.async_generate:
             self._prefetch(dataloader)
+        self._eval_tool_ious = {'crop': [], 'select': []}
         output = super().evaluation_loop(dataloader, *args, **kwargs)
+        metric_key_prefix = kwargs.get('metric_key_prefix', 'eval')
+        for tool_name, values in self._eval_tool_ious.items():
+            if values:
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_mean'] = sum(values) / len(values)
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_median'] = statistics.median(values)
         self.eval_flag = True
         return output
 
@@ -2163,6 +2185,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     def _prepare_metrics(self):
         args = self.args
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
+        self._eval_tool_ious = {'crop': [], 'select': []}
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print

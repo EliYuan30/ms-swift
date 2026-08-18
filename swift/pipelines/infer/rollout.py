@@ -671,8 +671,9 @@ def llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int
             try:
                 result = method(*args, **kwargs)
             except Exception:
-                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
-                result = None
+                error = traceback.format_exc()
+                logger.error(f'Method execution failed: {method_name}\n{error}')
+                result = {'__swift_worker_error__': error, '__swift_worker_method__': method_name}
             if command['type'] == 'call':
                 connection.send(result)
         elif command['type'] == 'shutdown':
@@ -719,8 +720,9 @@ async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, mast
             try:
                 result = await method(*args, **kwargs)
             except Exception:
-                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
-                result = None
+                error = traceback.format_exc()
+                logger.error(f'Method execution failed: {method_name}\n{error}')
+                result = {'__swift_worker_error__': error, '__swift_worker_method__': method_name}
 
             if command['type'] == 'call':
                 connection.send(result)
@@ -994,7 +996,31 @@ class SwiftRolloutDeploy(SwiftPipeline):
             connection.send({'type': 'call', 'method': 'reset_prefix_cache'})
         # Wait for and collect all results
         all_outputs = [connection.recv() for connection in self.connections]
-        success = all(output for output in all_outputs)
+        for output in all_outputs:
+            if isinstance(output, dict) and '__swift_worker_error__' in output:
+                raise RuntimeError(
+                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
+                    f"{output['__swift_worker_error__']}"
+                )
+        for output in all_outputs:
+            if isinstance(output, dict) and '__swift_worker_error__' in output:
+                raise RuntimeError(
+                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
+                    f"{output['__swift_worker_error__']}"
+                )
+        for output in all_outputs:
+            if isinstance(output, dict) and '__swift_worker_error__' in output:
+                raise RuntimeError(
+                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
+                    f"{output['__swift_worker_error__']}"
+                )
+        for output in all_outputs:
+            if isinstance(output, dict) and '__swift_worker_error__' in output:
+                raise RuntimeError(
+                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
+                    f"{output['__swift_worker_error__']}"
+                )
+        # Handle empty prompts (see above)
         return {'message': 'Request received, resetting prefix cache status: ' + str(success)}
 
     async def reset_encoder_cache(self):
@@ -1075,6 +1101,12 @@ class SwiftRolloutDeploy(SwiftPipeline):
             connection.send({'type': 'call', 'method': method, 'kwargs': kwargs})
 
         all_outputs = [connection.recv() for connection in self.connections]
+        for output in all_outputs:
+            if isinstance(output, dict) and '__swift_worker_error__' in output:
+                raise RuntimeError(
+                    f"Rollout worker failed in `{output.get('__swift_worker_method__')}`:\n"
+                    f"{output['__swift_worker_error__']}"
+                )
         # Handle empty prompts (see above)
         all_outputs = [output for output, requests in zip(all_outputs, chunked_infer_requests) if requests]
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
