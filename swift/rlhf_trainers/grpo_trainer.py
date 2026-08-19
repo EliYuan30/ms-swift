@@ -2008,7 +2008,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 df = pd.DataFrame(wandb_table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=['prompt'])
-                wandb.log({'completions': wandb.Table(dataframe=df)})
+                wandb.log({'completions': wandb.Table(dataframe=df)}, step=self.state.global_step)
 
             if report_to_swanlab:
                 headers = list(table.keys())
