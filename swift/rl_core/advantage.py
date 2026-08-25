@@ -7,6 +7,25 @@ from typing import Dict, List, Optional, Tuple
 from swift.utils import nanstd
 
 
+def center_rewards_within_masked_groups(
+    rewards: torch.Tensor,
+    mask: torch.Tensor,
+    num_generations: int,
+) -> torch.Tensor:
+    """Center a reward only within the selected trajectories of each prompt group."""
+    if rewards.ndim != 1 or mask.ndim != 1 or rewards.shape != mask.shape:
+        raise ValueError('rewards and mask must be aligned 1-D tensors')
+    if rewards.numel() % num_generations != 0:
+        raise ValueError('reward count must be divisible by num_generations')
+
+    grouped_rewards = rewards.view(-1, num_generations)
+    grouped_mask = mask.bool().view(-1, num_generations)
+    counts = grouped_mask.sum(dim=1, keepdim=True)
+    means = grouped_rewards.masked_fill(~grouped_mask, 0.0).sum(dim=1, keepdim=True) / counts.clamp(min=1)
+    active = grouped_mask & (counts > 1)
+    return torch.where(active, grouped_rewards - means, torch.zeros_like(grouped_rewards)).view(-1)
+
+
 def compute_advantages(
     rewards_per_func: torch.Tensor,
     reward_weights: torch.Tensor,

@@ -787,11 +787,16 @@ def replace_assistant_response_with_ids(messages: 'Messages',
         [{'role': 'user', 'content': 'Hello'},
          {'role': 'assistant', 'content': {'input_ids': [1, 2, 3], 'loss_scale': [1, 1, 0]}}]
     """
-    # Normalize input to always be list of lists
+    # Normalize input to always be list of lists and copy it. Prefix injection below
+    # must not mutate the sample's raw rollout token/mask frame.
     if isinstance(completion_ids[0], int):
-        completion_ids = [completion_ids]
+        completion_ids = [list(completion_ids)]
+    else:
+        completion_ids = [list(ids) for ids in completion_ids]
     if loss_mask and isinstance(loss_mask[0], int):
-        loss_mask = [loss_mask]
+        loss_mask = [list(loss_mask)]
+    elif loss_mask:
+        loss_mask = [list(mask) for mask in loss_mask]
 
     # Inject the non-thinking prefix (e.g. '<think>\n\n</think>\n\n') into the LAST assistant turn.
     # When enable_thinking false, the engine prepends non_thinking_prefix before generation
@@ -2008,20 +2013,128 @@ def build_response_token_mask(
     nested_masks: List[Optional[List[List[int]]]],
     completion_mask: torch.Tensor,
     device: torch.device,
+    response_loss_masks: Optional[List[Optional[List[List[int]]]]] = None,
+    completion_turn_token_ids: Optional[List[List[List[int]]]] = None,
 ) -> Optional[torch.Tensor]:
     """Align scheduler-provided per-turn token masks to the completion frame."""
     if not any(mask for mask in nested_masks):
         return None
     result = torch.zeros_like(completion_mask, dtype=torch.bool, device=device)
     for row, nested in enumerate(nested_masks):
-        flat = [int(value) for turn in (nested or []) for value in turn]
         completion_indices = completion_mask[row].nonzero(as_tuple=True)[0]
+        if completion_turn_token_ids is not None:
+            turn_targets = completion_turn_token_ids[row]
+            turn_masks = (response_loss_masks[row] if response_loss_masks else None) or []
+            flat = []
+            for turn_index, target_ids in enumerate(turn_targets):
+                raw_mask = list(turn_masks[turn_index]) if turn_index < len(turn_masks) else []
+                has_raw_values = bool(nested and turn_index < len(nested))
+                raw_values = list(nested[turn_index]) if has_raw_values else []
+                if raw_mask:
+                    if not has_raw_values:
+                        raw_values = [0] * len(raw_mask)
+                    elif len(raw_values) < len(raw_mask):
+                        missing = len(raw_mask) - len(raw_values)
+                        if any(raw_mask[:missing]):
+                            raise ValueError(
+                                f'Cannot align response token mask for sample {row}, turn {turn_index}: '
+                                f'{len(raw_values)} values vs {len(raw_mask)} raw tokens.')
+                        raw_values = [0] * missing + raw_values
+                    elif len(raw_values) > len(raw_mask):
+                        raise ValueError(
+                            f'Cannot align response token mask for sample {row}, turn {turn_index}: '
+                            f'{len(raw_values)} values vs {len(raw_mask)} raw tokens.')
+                    active_values = [int(value) for value, active in zip(raw_values, raw_mask) if active]
+                else:
+                    active_values = [int(value) for value in raw_values]
+                if len(active_values) > len(target_ids):
+                    raise ValueError(
+                        f'Response token mask has {len(active_values)} active values but student turn '
+                        f'{turn_index} has only {len(target_ids)} completion tokens for sample {row}.')
+                flat.extend(active_values)
+                # Template-owned assistant boundary tokens are never branch tokens.
+                flat.extend([0] * (len(target_ids) - len(active_values)))
+        else:
+            flat = [int(value) for turn in (nested or []) for value in turn]
         if len(flat) > len(completion_indices):
             flat = flat[:len(completion_indices)]
         if flat:
             indices = completion_indices[:len(flat)]
             result[row, indices] = torch.tensor(flat, dtype=torch.bool, device=device)
     return result
+
+
+def build_completion_turn_token_ids(
+    samples: List[OnPolicySample],
+    completion_mask: torch.Tensor,
+) -> List[List[List[int]]]:
+    """Recover exact active student token ids for every assistant turn.
+
+    Raw rollout ids omit template-owned assistant boundaries, while training labels
+    activate those boundaries and mask tool observations / response prefixes. Match
+    every raw turn in the encoded sequence, then let ``labels`` define its target ids.
+    """
+
+    def as_list(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().tolist()
+        if value and isinstance(value[0], list):
+            if len(value) != 1:
+                raise ValueError(f'Expected a per-sample 1-D encoded sequence, got {len(value)} rows.')
+            value = value[0]
+        return list(value or [])
+
+    def as_turns(value):
+        if not value:
+            return []
+        if isinstance(value[0], int):
+            return [list(value)]
+        return [list(turn) for turn in value]
+
+    def find_last_subsequence(sequence, subsequence, end):
+        for start in range(end - len(subsequence), -1, -1):
+            if sequence[start:start + len(subsequence)] == subsequence:
+                return start
+        return None
+
+    batch_turn_ids: List[List[List[int]]] = []
+    for row, sample in enumerate(samples):
+        token_turns = as_turns(sample.response_token_ids)
+        if not token_turns:
+            batch_turn_ids.append([])
+            continue
+        encoded = sample.encoded or {}
+        input_ids = as_list(encoded.get('input_ids'))
+        labels = as_list(encoded.get('labels'))
+        if len(input_ids) != len(labels):
+            raise ValueError(
+                f'Encoded input_ids/labels length mismatch for sample {row}: {len(input_ids)} vs {len(labels)}.')
+
+        cursor = len(input_ids)
+        spans = []
+        for turn_index in range(len(token_turns) - 1, -1, -1):
+            tokens = token_turns[turn_index]
+            start = find_last_subsequence(input_ids, tokens, cursor)
+            if start is None:
+                raise ValueError(
+                    f'Could not locate raw assistant turn {turn_index} ({len(tokens)} tokens) in the '
+                    f'encoded student sequence for sample {row}.')
+            spans.append((start, start + len(tokens)))
+            cursor = start
+        spans.reverse()
+
+        turn_ids = []
+        for turn_index, (start, _) in enumerate(spans):
+            region_end = spans[turn_index + 1][0] if turn_index + 1 < len(spans) else len(input_ids)
+            turn_ids.append([input_ids[pos] for pos in range(start, region_end) if labels[pos] != -100])
+        expected = int(completion_mask[row].sum().item())
+        actual = sum(len(ids) for ids in turn_ids)
+        if actual != expected:
+            raise ValueError(
+                f'Encoded assistant turns contain {actual} active tokens but completion_mask has {expected} '
+                f'for sample {row}; per-turn lengths are {[len(ids) for ids in turn_ids]}.')
+        batch_turn_ids.append(turn_ids)
+    return batch_turn_ids
 
 
 def _normalize_routed_experts_tensor(value: Any) -> torch.Tensor:
@@ -2151,10 +2264,15 @@ def collate_to_grpo_micro_batch(
         device=device,
         logits_to_keep=logits_to_keep,
     )
+    completion_turn_token_ids = build_completion_turn_token_ids(samples, completion_mask)
     truncated_mask = torch.tensor([bool(s.is_truncated) for s in samples], dtype=torch.bool, device=device)
     rollout_per_token_logps = build_rollout_logps([s.rollout_logprobs for s in samples], completion_mask, device)
     branch_token_mask = build_response_token_mask(
-        [(s.rollout_infos or {}).get('branch_response_mask') for s in samples], completion_mask, device)
+        [(s.rollout_infos or {}).get('branch_response_mask') for s in samples],
+        completion_mask,
+        device,
+        response_loss_masks=[s.response_loss_mask for s in samples],
+        completion_turn_token_ids=completion_turn_token_ids)
 
     routed_experts = build_routed_experts_batch(
         samples,
@@ -2174,6 +2292,7 @@ def collate_to_grpo_micro_batch(
         seq_lengths=seq_lengths,
         rollout_per_token_logps=rollout_per_token_logps,
         branch_token_mask=branch_token_mask,
+        completion_turn_token_ids=completion_turn_token_ids,
         logits_to_keep=logits_to_keep,
     )
     return model_inputs, grpo_batch

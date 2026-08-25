@@ -182,6 +182,8 @@ def assemble_teacher_completion_logprobs(
     completion_mask: torch.Tensor,
     device: torch.device,
     response_token_ids: Optional[List[List[int]]] = None,
+    response_loss_mask: Optional[List[List[int]]] = None,
+    completion_turn_token_ids: Optional[List[List[List[int]]]] = None,
 ) -> TeacherOutput:
     """Align parsed teacher *sampled-token* prompt logprobs to a ``[B, T, 1]`` completion frame (GRPO/OPD-RL).
 
@@ -190,10 +192,30 @@ def assemble_teacher_completion_logprobs(
     ``completion_mask``'s response region.
 
     When the teacher API returns logprobs for the **full sequence** (prompt + response
-    + end tokens), ``response_token_ids`` is used to locate the response portion by
-    matching token IDs from the end of the sequence (the response is the last
-    ``count`` tokens before the end tokens).
+    + tool messages + end tokens), each assistant turn is located independently from
+    the end of the sequence. ``response_loss_mask`` selects raw rollout action tokens,
+    while ``completion_turn_token_ids`` supplies the exact student-label target for the
+    turn, including template-owned assistant boundary tokens. This is required for
+    multi-turn tool trajectories: assistant spans are separated by masked tool responses.
     """
+
+    def as_turns(values):
+        if not values:
+            return []
+        if isinstance(values[0], int):
+            return [list(values)]
+        return [list(turn) for turn in values]
+
+    def find_last_subsequence(sequence, subsequence, end):
+        """Return the last start < ``end`` whose slice equals ``subsequence``."""
+        if not subsequence:
+            return end
+        last_start = end - len(subsequence)
+        for start in range(last_start, -1, -1):
+            if sequence[start:start + len(subsequence)] == subsequence:
+                return start
+        return None
+
     batch_size, seq_len = completion_mask.shape
     out_lp = torch.zeros(batch_size, seq_len, 1, dtype=torch.float32, device=device)
     out_ix = torch.zeros(batch_size, seq_len, 1, dtype=torch.long, device=device)
@@ -202,42 +224,115 @@ def assemble_teacher_completion_logprobs(
         count = completion_indices.numel()
         if count == 0:
             continue
-        if len(lps) == count + 1:
-            lps, ixs = lps[:count], ixs[:count]
-        elif len(lps) > count + 1 and response_token_ids is not None:
-            # Teacher returned logprobs for the full sequence (prompt + response + end tokens).
-            # Locate the response portion by matching token IDs from the end.
-            rti = response_token_ids[i]
-            if isinstance(rti[0], list):
-                rti = rti[0]  # flatten [[1,2,3]] -> [1,2,3]
-            flat_ixs = [ix[0] for ix in ixs]  # each ix is a single-element list [token_id]
-            # Search from the end: find the starting index where the last `count` tokens
-            # match the response token IDs (allowing 0-2 end tokens after the response).
-            start = None
-            for offset in range(min(3, len(lps) - count + 1)):  # try 0, 1, 2 end tokens
-                candidate_start = len(flat_ixs) - count - offset
-                if candidate_start < 0:
-                    continue
-                if flat_ixs[candidate_start:candidate_start + count] == rti[:count]:
-                    start = candidate_start
-                    break
-            if start is not None:
-                lps = lps[start:start + count]
-                ixs = ixs[start:start + count]
+        if len(lps) != count and response_token_ids is not None:
+            token_turns = as_turns(response_token_ids[i])
+            if response_loss_mask is None or not response_loss_mask[i]:
+                mask_turns = [[1] * len(turn) for turn in token_turns]
             else:
-                # The response token ids did not align anywhere in the returned sequence: the teacher
-                # tokenized differently than the student, so any slice would yield a meaningless
-                # per-token KL. Fail loudly rather than silently mis-aligning.
+                mask_turns = as_turns(response_loss_mask[i])
+            if len(token_turns) != len(mask_turns) or any(
+                    len(tokens) != len(mask) for tokens, mask in zip(token_turns, mask_turns)):
                 raise ValueError(
-                    f'Teacher returned {len(lps)} logprobs but could not locate the {count} sampled response '
-                    'tokens by id. The teacher server must use the same tokenizer as the student '
-                    '(token-in-token-out).')
+                    f'response_token_ids and response_loss_mask are not aligned for sample {i}: '
+                    f'{[len(turn) for turn in token_turns]} vs {[len(turn) for turn in mask_turns]}')
+
+            flat_ixs = [ix[0] for ix in ixs]
+            cursor = len(flat_ixs)
+            selected_turns = []
+            # Match backwards so repeated token sequences in the user prompt cannot steal an
+            # assistant-turn match. Preserve chronological order when assembling the result.
+            for turn_index in range(len(token_turns) - 1, -1, -1):
+                tokens = token_turns[turn_index]
+                start = find_last_subsequence(flat_ixs, tokens, cursor)
+                if start is None:
+                    raise ValueError(
+                        f'Teacher returned {len(lps)} logprobs but could not locate assistant turn '
+                        f'{turn_index} ({len(tokens)} raw tokens) for the {count} sampled response tokens by id. '
+                        'The teacher server must preserve student token ids (token-in-token-out).')
+                mask = mask_turns[turn_index]
+                raw_selected = [(lps[start + j], ixs[start + j]) for j, active in enumerate(mask) if active]
+                if completion_turn_token_ids is not None:
+                    expected_ids = completion_turn_token_ids[i][turn_index]
+                    boundary_count = len(expected_ids) - len(raw_selected)
+                    if boundary_count < 0:
+                        raise ValueError(
+                            f'Raw response mask selected {len(raw_selected)} tokens but encoded student turn '
+                            f'{turn_index} has only {len(expected_ids)} active tokens for sample {i}.')
+                    boundary_start = start + len(tokens)
+                    boundary_end = boundary_start + boundary_count
+                    if boundary_end > len(lps):
+                        raise ValueError(
+                            f'Teacher sequence ended before {boundary_count} assistant boundary tokens for '
+                            f'sample {i}, turn {turn_index}.')
+                    turn_selected = raw_selected + [
+                        (lps[pos], ixs[pos]) for pos in range(boundary_start, boundary_end)
+                    ]
+                    actual_ids = [item[1][0] for item in turn_selected]
+                    if actual_ids != list(expected_ids):
+                        raise ValueError(
+                            f'Teacher/student active token ids differ for sample {i}, turn {turn_index}: '
+                            f'teacher length {len(actual_ids)}, student length {len(expected_ids)}. '
+                            'The teacher must use the same tokenizer and chat template as the student.')
+                else:
+                    turn_selected = raw_selected
+                selected_turns.append(turn_selected)
+                cursor = start
+            selected_turns.reverse()
+            selected = [item for turn in selected_turns for item in turn]
+            if len(selected) != count:
+                raise ValueError(
+                    f'Teacher response masks selected {len(selected)} tokens but completion_mask has {count} '
+                    f'active tokens for sample {i}.')
+            lps = [item[0] for item in selected]
+            ixs = [item[1] for item in selected]
+        elif len(lps) == count + 1:
+            lps, ixs = lps[:count], ixs[:count]
         assert len(lps) == count, (f'Teacher logp count {len(lps)} != sampled tokens {count}. The teacher server '
                                    'must use the same tokenizer as the student (token-in-token-out).')
         # lps/ixs are per-position single-element lists ([[lp], ...]) -> [count, 1].
         out_lp[i, completion_indices] = torch.tensor(lps, dtype=torch.float32, device=device)
         out_ix[i, completion_indices] = torch.tensor(ixs, dtype=torch.long, device=device)
     return TeacherOutput(topk_logprobs=out_lp, topk_indices=out_ix)
+
+
+def align_teacher_routes_to_completion_turns(
+    route_turns: Optional[List[List[Any]]],
+    response_loss_mask: Optional[List[List[int]]],
+    completion_turn_token_ids: List[List[int]],
+    default_route: Any,
+) -> List[Any]:
+    """Expand raw per-turn teacher routes into the student completion frame."""
+    route_turns = route_turns or []
+    response_loss_mask = response_loss_mask or []
+    aligned = []
+    for turn_index, target_ids in enumerate(completion_turn_token_ids):
+        raw_mask = list(response_loss_mask[turn_index]) if turn_index < len(response_loss_mask) else []
+        raw_routes = list(route_turns[turn_index]) if turn_index < len(route_turns) else []
+        if raw_mask:
+            if not raw_routes:
+                raw_routes = [default_route] * len(raw_mask)
+            elif len(raw_routes) < len(raw_mask):
+                missing = len(raw_mask) - len(raw_routes)
+                if any(raw_mask[:missing]):
+                    raise ValueError(
+                        f'Cannot align teacher routes for turn {turn_index}: {len(raw_routes)} routes vs '
+                        f'{len(raw_mask)} raw tokens.')
+                raw_routes = [default_route] * missing + raw_routes
+            elif len(raw_routes) > len(raw_mask):
+                raise ValueError(
+                    f'Cannot align teacher routes for turn {turn_index}: {len(raw_routes)} routes vs '
+                    f'{len(raw_mask)} raw tokens.')
+            active_routes = [route for route, active in zip(raw_routes, raw_mask) if active]
+        else:
+            active_routes = raw_routes or [default_route] * len(target_ids)
+        if len(active_routes) > len(target_ids):
+            raise ValueError(
+                f'Teacher routes have {len(active_routes)} active values but student turn {turn_index} '
+                f'has only {len(target_ids)} completion tokens.')
+        boundary_route = active_routes[-1] if active_routes else default_route
+        aligned.extend(active_routes)
+        aligned.extend([boundary_route] * (len(target_ids) - len(active_routes)))
+    return aligned
 
 
 @dataclass

@@ -277,6 +277,7 @@ class GRPOTrainer(BaseRayTrainer):
 
         requests = build_teacher_requests(chunk_samples, self.template)
         all_rti = [s.response_token_ids for s in chunk_samples]
+        all_rlm = [s.response_loss_mask for s in chunk_samples]
         parsed = fetch_teacher_parsed_by_routing(
             chunk_samples,
             requests,
@@ -293,7 +294,12 @@ class GRPOTrainer(BaseRayTrainer):
             device = gb.completion_mask.device
             n = gb.completion_mask.shape[0]
             teacher_out = assemble_teacher_completion_logprobs(
-                parsed[offset:offset + n], gb.completion_mask, device, response_token_ids=all_rti[offset:offset + n])
+                parsed[offset:offset + n],
+                gb.completion_mask,
+                device,
+                response_token_ids=all_rti[offset:offset + n],
+                response_loss_mask=all_rlm[offset:offset + n],
+                completion_turn_token_ids=gb.completion_turn_token_ids)
             gb.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
             offset += n
 

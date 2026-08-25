@@ -777,6 +777,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         """
         requests = build_teacher_requests(total_samples, self.template)
         all_rti = [s.response_token_ids for s in total_samples]
+        all_rlm = [s.response_loss_mask for s in total_samples]
         parsed = fetch_teacher_parsed_by_routing(
             total_samples,
             requests,
@@ -797,7 +798,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 parsed[offset:offset + n],
                 grpo_batch.completion_mask,
                 device,
-                response_token_ids=all_rti[offset:offset + n])
+                response_token_ids=all_rti[offset:offset + n],
+                response_loss_mask=all_rlm[offset:offset + n],
+                completion_turn_token_ids=grpo_batch.completion_turn_token_ids)
             grpo_batch.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
             offset += n
 

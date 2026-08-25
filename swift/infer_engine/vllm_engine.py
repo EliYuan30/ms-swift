@@ -417,6 +417,10 @@ class VllmEngine(InferEngine):
         template_meta = self.template.template_meta
         stop_words = (request_config.stop or []) + (self.generation_config.stop or []) + template_meta.stop_words
         generation_config.stop = self._get_stop_words(stop_words)
+        # Tool schedulers need the closing tag in the returned text so they can
+        # parse and execute the call after vLLM stops at the agent boundary.
+        if '</tool_call>' in generation_config.stop and hasattr(generation_config, 'include_stop_str_in_output'):
+            generation_config.include_stop_str_in_output = True
         # stop parameter is not effective in v1 engine (test version: vllm 0.8.5.post)
         generation_config.stop_token_ids = self._get_stop_token_ids(stop_words)
 

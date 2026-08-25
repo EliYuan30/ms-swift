@@ -322,6 +322,9 @@ class GRPOBatch:
     rollout_per_token_logps: Optional[torch.Tensor] = None  # [B, T]
     teacher_per_token_logps: Optional[torch.Tensor] = None  # [B, T], OPD-RL teacher logp on sampled tokens
     branch_token_mask: Optional[torch.Tensor] = None  # [B, T], canonical branch tokens trained with NLL
+    # Exact active student token ids grouped by assistant turn. This includes
+    # template-owned boundaries and excludes loss-masked response prefixes.
+    completion_turn_token_ids: Optional[List[List[List[int]]]] = None
     advantages: Optional[torch.Tensor] = None  # [B, T] per-token (base broadcast minus per-token teacher KL)
     num_items_in_batch: Optional[torch.Tensor] = None  # scalar
     logits_to_keep: Optional[int] = None

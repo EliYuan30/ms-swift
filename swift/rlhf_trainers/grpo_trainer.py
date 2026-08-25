@@ -50,12 +50,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from swift.dataset import RowPreprocessor
 from swift.rewards import orms, rm_plugins
-from swift.rl_core.advantage import (apply_rlsd_reweight, compute_advantages, compute_advantages_dynamic,
-                                     compute_reward_metrics, compute_sdar_loss, compute_teacher_kl_per_token,
-                                     compute_teacher_logratio, expand_advantage_to_per_token)
+from swift.rl_core.advantage import (apply_rlsd_reweight, center_rewards_within_masked_groups, compute_advantages,
+                                     compute_advantages_dynamic, compute_reward_metrics, compute_sdar_loss,
+                                     compute_teacher_kl_per_token, compute_teacher_logratio, expand_advantage_to_per_token)
 from swift.rl_core.data import GRPOBatch, GRPOSample
 from swift.rl_core.grpo_algorithm import score_completions
-from swift.rlhf_trainers.gkd_helpers import (assemble_teacher_completion_logprobs, build_opsd_samples,
+from swift.rlhf_trainers.gkd_helpers import (align_teacher_routes_to_completion_turns,
+                                             assemble_teacher_completion_logprobs, build_opsd_samples,
                                              build_teacher_requests, encode_teacher_view,
                                              fetch_teacher_parsed_by_routing, remap_teacher_logps_to_student_frame,
                                              should_compute_local_teacher_logps)
@@ -354,19 +355,27 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     self._logs[key].extend(self._gather_and_flatten(value, flatten_level=0))
 
             if not self.model.training and any('tool_metadata' in s.extra for s in samples):
-                from tool_rewards import tool_iou_metrics
+                from tool_rewards import CROP_TOOL, SELECT_TOOL, tool_iou_metrics
 
-                local_metrics = [
-                    tool_iou_metrics(
-                        s.extra.get('tool_metadata'),
-                        (s.rollout_infos or {}).get('tool_calls', []),
-                    ) for s in samples
-                ]
-                for metric in gather_object(local_metrics):
-                    for tool_name in ('crop', 'select'):
-                        value = metric[tool_name]
+                tool_names = {'crop': CROP_TOOL, 'select': SELECT_TOOL}
+                local_metrics = []
+                for sample in samples:
+                    calls = (sample.rollout_infos or {}).get('tool_calls', [])
+                    sampled_calls = [
+                        call for call in calls
+                        if call.get('sampled', not call.get('injected', False)) and not call.get('injected', False)
+                    ]
+                    local_metrics.append({
+                        'ious': tool_iou_metrics(sample.extra.get('tool_metadata'), sampled_calls),
+                        'called': [call.get('name') for call in sampled_calls],
+                    })
+                for result in gather_object(local_metrics):
+                    for tool_name, call_name in tool_names.items():
+                        value = result['ious'][tool_name]
                         if value is not None:
                             self._eval_tool_ious[tool_name].append(value)
+                            if call_name in result['called']:
+                                self._eval_tool_ious_called[tool_name].append(value)
 
     @profiling_decorator
     def _compute_rewards_per_func(self, samples: List[GRPOSample]) -> torch.Tensor:
@@ -412,6 +421,139 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 total_rewards_per_func, dtype=torch.float32, device=self.accelerator.device)
 
         return total_rewards_per_func
+
+    def _gather_utility_rollout_info(self, samples: List[GRPOSample]) -> Optional[List[Dict[str, Any]]]:
+        if not any(getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
+            return None
+
+        from tool_rewards import CROP_TOOL, SELECT_TOOL, parse_tool_metadata
+
+        local_info = []
+        for sample in samples:
+            calls = (sample.rollout_infos or {}).get('tool_calls') or []
+            metadata = parse_tool_metadata(sample.extra.get('tool_metadata'))
+            sampled_calls = [
+                call for call in calls
+                if call.get('sampled', not call.get('injected', False))
+            ]
+            expected_tools = {
+                step.get('name')
+                for step in metadata.get('canonical_tool_plan') or []
+                if step.get('name') in {CROP_TOOL, SELECT_TOOL}
+            }
+            preferred_tool = metadata.get('preferred_tool')
+            if not expected_tools and preferred_tool in {CROP_TOOL, SELECT_TOOL}:
+                expected_tools.add(preferred_tool)
+            evidence_calls = [
+                call for call in sampled_calls
+                if not call.get('injected', False)
+                and call.get('success', True)
+                and call.get('name') in expected_tools
+            ]
+            local_info.append({
+                'tool_call_count': len(sampled_calls),
+                'evidence_tool_call_count': len(evidence_calls),
+                'tool_applicable': metadata.get('tool_applicable'),
+            })
+        return gather_object(local_info)
+
+    def _condition_rewards_for_advantage(
+        self,
+        rewards_per_func: torch.Tensor,
+        utility_info: Optional[List[Dict[str, Any]]],
+        num_generations: int,
+    ) -> Tuple[torch.Tensor, List[int]]:
+        conditional_indices = [
+            i for i, func in enumerate(self.reward_funcs)
+            if getattr(func, 'condition_within_tool_calls', False)
+        ]
+        if (
+            not conditional_indices
+            or utility_info is None
+            or not self.model.training
+            or self.dynamic_num_samples
+            or num_generations <= 1
+        ):
+            return rewards_per_func, []
+
+        tool_mask = torch.tensor(
+            [info['evidence_tool_call_count'] > 0 for info in utility_info],
+            dtype=torch.bool,
+            device=rewards_per_func.device,
+        )
+        if tool_mask.numel() != rewards_per_func.shape[0]:
+            raise ValueError('Gathered tool-call flags do not align with gathered rewards.')
+
+        conditioned = rewards_per_func.clone()
+        for index in conditional_indices:
+            conditioned[:, index] = center_rewards_within_masked_groups(
+                conditioned[:, index], tool_mask, num_generations)
+
+        group_tool_counts = tool_mask.view(-1, num_generations).sum(dim=1)
+        self._metrics['train']['routing/evidence_active_group_rate'].append(
+            (group_tool_counts > 1).float().mean().item())
+        return conditioned, conditional_indices
+
+    def _log_utility_routing_metrics(
+        self,
+        utility_info: Optional[List[Dict[str, Any]]],
+        rewards_per_func: torch.Tensor,
+        advantages: torch.Tensor,
+        num_generations: int,
+    ) -> None:
+        if utility_info is None:
+            return
+
+        mode = 'train' if self.model.training else 'eval'
+        device = rewards_per_func.device
+        call_counts = torch.tensor(
+            [info['tool_call_count'] for info in utility_info], dtype=torch.long, device=device)
+        direct_mask = call_counts == 0
+        tool_mask = call_counts > 0
+        self._metrics[mode]['routing/direct_rate'].append(direct_mask.float().mean().item())
+        self._metrics[mode]['routing/one_tool_rate'].append((call_counts == 1).float().mean().item())
+        self._metrics[mode]['routing/two_plus_tool_rate'].append((call_counts >= 2).float().mean().item())
+
+        grouped_tool = None
+        mixed = None
+        if not self.dynamic_num_samples and num_generations > 1 and call_counts.numel() % num_generations == 0:
+            grouped_tool = tool_mask.view(-1, num_generations)
+            mixed = grouped_tool.any(dim=1) & ~grouped_tool.all(dim=1)
+            self._metrics[mode]['routing/mixed_group_rate'].append(mixed.float().mean().item())
+
+        for label, expected in (('applicable', True), ('not_applicable', False), ('unknown', None)):
+            subset = torch.tensor(
+                [info['tool_applicable'] is expected for info in utility_info], dtype=torch.bool, device=device)
+            if subset.any():
+                self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
+
+        correctness_index = next(
+            (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
+        if correctness_index is not None:
+            correctness = rewards_per_func[:, correctness_index]
+            if direct_mask.any():
+                self._metrics[mode]['routing/correctness/direct'].append(correctness[direct_mask].mean().item())
+            if tool_mask.any():
+                self._metrics[mode]['routing/correctness/tool'].append(correctness[tool_mask].mean().item())
+                if mixed is not None and mixed.any():
+                    grouped_correctness = correctness.view(-1, num_generations)
+                    tool_correctness = (
+                        grouped_correctness.masked_fill(~grouped_tool, 0.0).sum(dim=1)
+                        / grouped_tool.sum(dim=1).clamp(min=1)
+                    )
+                    direct_correctness = (
+                        grouped_correctness.masked_fill(grouped_tool, 0.0).sum(dim=1)
+                        / (~grouped_tool).sum(dim=1).clamp(min=1)
+                    )
+                    deltas = (tool_correctness - direct_correctness)[mixed]
+                    self._metrics[mode]['routing/mixed_correctness_delta'].append(deltas.mean().item())
+                    self._metrics[mode]['routing/tool_better_group_rate'].append((deltas > 0).float().mean().item())
+                    self._metrics[mode]['routing/direct_better_group_rate'].append((deltas < 0).float().mean().item())
+                    self._metrics[mode]['routing/equal_group_rate'].append((deltas == 0).float().mean().item())
+        if direct_mask.any():
+            self._metrics[mode]['routing/advantage/direct'].append(advantages[direct_mask].mean().item())
+        if tool_mask.any():
+            self._metrics[mode]['routing/advantage/tool'].append(advantages[tool_mask].mean().item())
 
     def _compute_advantages(self, samples: List[GRPOSample], rewards_per_func: torch.Tensor,
                             batch_encoded_inputs: List[Dict[str, Any]]) -> torch.Tensor:
@@ -486,6 +628,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             kl_values = torch.cat(kl_list, dim=0)
             kl_values = gather(kl_values)
 
+        mode = 'train' if self.model.training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+        utility_info = self._gather_utility_rollout_info(samples)
+        advantage_rewards_per_func, conditional_indices = self._condition_rewards_for_advantage(
+            rewards_per_func, utility_info, num_generations)
+
         # Keep weighted rewards for the request-aware (multi-turn) path below.
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
         if self.kl_in_reward and self.beta != 0.0:
@@ -494,11 +642,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # --------------------------------------------------
         # Case 1: Default grouped mode
         # --------------------------------------------------
-        mode = 'train' if self.model.training else 'eval'
-        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
         if not self.dynamic_num_samples:
             advantages, weighted_rewards = compute_advantages(
-                rewards_per_func=rewards_per_func,
+                rewards_per_func=advantage_rewards_per_func,
                 reward_weights=self.reward_weights,
                 num_generations=num_generations,
                 advantage_estimator=self.advantage_estimator,
@@ -523,6 +669,25 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             for name in self.reward_func_names:
                 self._metrics[mode][f'rewards/{name}/mean'].append(reward_metrics.per_func_mean[name])
                 self._metrics[mode][f'rewards/{name}/std'].append(reward_metrics.per_func_std[name])
+            if conditional_indices:
+                raw_reward_metrics = compute_reward_metrics(
+                    rewards=rewards,
+                    rewards_per_func=rewards_per_func,
+                    reward_func_names=self.reward_func_names,
+                    num_generations=num_generations,
+                    scale_rewards=self.scale_rewards,
+                )
+                self._metrics[mode]['reward_raw'].append(raw_reward_metrics.reward_mean)
+                self._metrics[mode]['reward_raw_std'].append(raw_reward_metrics.reward_std)
+                for index in conditional_indices:
+                    name = self.reward_func_names[index]
+                    conditioned_col = advantage_rewards_per_func[:, index]
+                    self._metrics[mode][f'rewards/{name}/conditioned_mean'].append(
+                        torch.nanmean(conditioned_col).item())
+                    self._metrics[mode][f'rewards/{name}/conditioned_std'].append(
+                        nanstd(conditioned_col).item())
+            self._log_utility_routing_metrics(
+                utility_info, rewards_per_func, advantages, num_generations)
             log_rewards_all(rewards_per_func)
             return advantages
 
@@ -556,6 +721,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             unique_indices = self._get_last_indices(request_ids)
             log_rewards_metrics(
                 rewards=rewards[unique_indices], rewards_per_func_for_metrics=rewards_per_func[unique_indices])
+            self._log_utility_routing_metrics(
+                utility_info, rewards_per_func, advantages, num_generations)
             log_rewards_all(rewards_per_func)
 
             return advantages
@@ -693,16 +860,22 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         teacher_parsed[offset:offset + n],
                         grpo_batch.completion_mask,
                         device,
-                        response_token_ids=[s.response_token_ids for s in chunk])
+                        response_token_ids=[s.response_token_ids for s in chunk],
+                        response_loss_mask=[s.response_loss_mask for s in chunk],
+                        completion_turn_token_ids=grpo_batch.completion_turn_token_ids)
                     teacher_logps.append(teacher_out.topk_logprobs[..., 0])
                 merged = torch.zeros_like(teacher_logps[0])
                 for row, sample in enumerate(chunk):
                     info = sample.rollout_infos or {}
-                    routes = [route for turn in info.get('teacher_route_by_turn', []) for route in turn]
                     default_route = info.get('default_teacher_route') or sample.get_tag(self.args.teacher_tag_key)
                     completion_indices = grpo_batch.completion_mask[row].nonzero(as_tuple=True)[0]
-                    routes = routes[:len(completion_indices)]
-                    routes.extend([default_route] * (len(completion_indices) - len(routes)))
+                    routes = align_teacher_routes_to_completion_turns(
+                        info.get('teacher_route_by_turn'), sample.response_loss_mask,
+                        grpo_batch.completion_turn_token_ids[row], default_route)
+                    if len(routes) != len(completion_indices):
+                        raise ValueError(
+                            f'Aligned teacher routes have {len(routes)} tokens but completion_mask has '
+                            f'{len(completion_indices)} for sample {row}.')
                     for token_index, route in zip(completion_indices, routes):
                         teacher_idx = route_to_teacher.get(str(route))
                         if teacher_idx is None:
@@ -716,7 +889,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     parsed[offset:offset + n],
                     grpo_batch.completion_mask,
                     device,
-                    response_token_ids=[s.response_token_ids for s in chunk])
+                    response_token_ids=[s.response_token_ids for s in chunk],
+                        response_loss_mask=[s.response_loss_mask for s in chunk],
+                        completion_turn_token_ids=grpo_batch.completion_turn_token_ids)
                 grpo_batch.teacher_per_token_logps = teacher_out.topk_logprobs[..., 0]
             offset += n
 
@@ -1906,12 +2081,21 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if self._queue.empty() and self.args.async_generate:
             self._prefetch(dataloader)
         self._eval_tool_ious = {'crop': [], 'select': []}
+        self._eval_tool_ious_called = {'crop': [], 'select': []}
         output = super().evaluation_loop(dataloader, *args, **kwargs)
         metric_key_prefix = kwargs.get('metric_key_prefix', 'eval')
         for tool_name, values in self._eval_tool_ious.items():
             if values:
                 output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_mean'] = sum(values) / len(values)
                 output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_median'] = statistics.median(values)
+                called_values = self._eval_tool_ious_called[tool_name]
+                output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_call_coverage'] = (
+                    len(called_values) / len(values))
+                if called_values:
+                    output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_called_mean'] = (
+                        sum(called_values) / len(called_values))
+                    output.metrics[f'{metric_key_prefix}_tool_iou/{tool_name}_called_median'] = (
+                        statistics.median(called_values))
         self.eval_flag = True
         return output
 
@@ -2144,6 +2328,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                                      if grpo_batch.teacher_per_token_logps is not None else None),
             branch_token_mask=(grpo_batch.branch_token_mask[start_idx:end_idx]
                                if grpo_batch.branch_token_mask is not None else None),
+            completion_turn_token_ids=(grpo_batch.completion_turn_token_ids[start_idx:end_idx]
+                                       if grpo_batch.completion_turn_token_ids is not None else None),
             advantages=grpo_batch.advantages[start_idx:end_idx] if grpo_batch.advantages is not None else None,
             num_items_in_batch=grpo_batch.num_items_in_batch,
             logits_to_keep=grpo_batch.logits_to_keep,
@@ -2186,6 +2372,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         args = self.args
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._eval_tool_ious = {'crop': [], 'select': []}
+        self._eval_tool_ious_called = {'crop': [], 'select': []}
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
