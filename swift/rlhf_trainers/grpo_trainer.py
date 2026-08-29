@@ -444,9 +444,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             preferred_tool = metadata.get('preferred_tool')
             if not expected_tools and preferred_tool in {CROP_TOOL, SELECT_TOOL}:
                 expected_tools.add(preferred_tool)
+            evidence_supervised = metadata.get(
+                'evidence_sensitive', metadata.get('tool_applicable')) is True
             evidence_calls = [
                 call for call in sampled_calls
-                if not call.get('injected', False)
+                if evidence_supervised
+                and not call.get('injected', False)
                 and call.get('success', True)
                 and call.get('name') in expected_tools
             ]
@@ -454,6 +457,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'tool_call_count': len(sampled_calls),
                 'evidence_tool_call_count': len(evidence_calls),
                 'tool_applicable': metadata.get('tool_applicable'),
+                'tool_beneficial': metadata.get('tool_beneficial'),
+                'evidence_sensitive': metadata.get('evidence_sensitive'),
             })
         return gather_object(local_info)
 
@@ -526,6 +531,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 [info['tool_applicable'] is expected for info in utility_info], dtype=torch.bool, device=device)
             if subset.any():
                 self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
+
+        for field in ('tool_beneficial', 'evidence_sensitive'):
+            for label, expected in (('true', True), ('false', False), ('unknown', None)):
+                subset = torch.tensor(
+                    [info[field] is expected for info in utility_info], dtype=torch.bool, device=device)
+                if subset.any():
+                    self._metrics[mode][f'routing/tool_rate/{field}/{label}'].append(
+                        tool_mask[subset].float().mean().item())
 
         correctness_index = next(
             (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
