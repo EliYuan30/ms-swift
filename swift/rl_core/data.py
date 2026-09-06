@@ -299,6 +299,7 @@ class GRPOSample(OnPolicySample):
     """On-policy sample with GRPO reward/advantage signals."""
     rewards: Optional[List[Optional[float]]] = None  # optional mirror; main path uses rewards_per_func tensor
     advantages: Optional[torch.Tensor] = None  # filled after _compute_advantages (0-dim tensor per sample)
+    route_advantage: Optional[torch.Tensor] = None  # uncentered route signal for the first assistant turn
 
 
 @dataclass

@@ -246,11 +246,18 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if self._has_teacher and self.use_teacher_api:
             self._assemble_teacher_api_logps(samples, batch_encoded_inputs)
         total_advantages = self._compute_advantages(samples, self._rewards_per_func, batch_encoded_inputs)
+        total_route_advantages = self._decoupled_route_advantages
 
         local_advantages = get_even_process_data(self, total_advantages)
-        assert len(local_advantages) == len(samples)
-        for i, advantage in enumerate(local_advantages):
+        local_route_advantages = (
+            get_even_process_data(self, total_route_advantages)
+            if total_route_advantages is not None
+            else [None] * len(samples)
+        )
+        assert len(local_advantages) == len(local_route_advantages) == len(samples)
+        for i, (advantage, route_advantage) in enumerate(zip(local_advantages, local_route_advantages)):
             samples[i].advantages = advantage
+            samples[i].route_advantage = route_advantage
         # log metrics in samples
         self._logs['advantages'].extend(total_advantages.tolist())
 
@@ -266,6 +273,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             device = self.accelerator.device
             grpo_batch: GRPOBatch = batch_encoded['grpo_batch']
             base_advantages = torch.stack([data.advantages.to(device) for data in batch])
+            route_advantages = None
+            if any(data.route_advantage is not None for data in batch):
+                if not all(data.route_advantage is not None for data in batch):
+                    raise ValueError('Decoupled route advantages are missing for part of a micro-batch.')
+                route_advantages = torch.stack([data.route_advantage.to(device) for data in batch])
             use_rlsd = (self.advantage_reweight == 'rlsd' and grpo_batch.teacher_per_token_logps is not None)
             use_sdar = (self.sdar_loss_coef > 0 and grpo_batch.teacher_per_token_logps is not None)
             if use_rlsd:
@@ -306,6 +318,22 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         clip = float(self.mopd_advantage_clip)
                         teacher_delta = teacher_delta.clamp(min=-clip, max=clip)
                     grpo_batch.advantages = grpo_batch.advantages + self.teacher_kl_coef * teacher_delta
+            if route_advantages is not None:
+                turn_boundaries = grpo_batch.completion_turn_token_ids or []
+                if len(turn_boundaries) != len(batch):
+                    raise ValueError(
+                        f'Expected {len(batch)} assistant-turn boundaries, got {len(turn_boundaries)}.')
+                first_turn_mask = torch.zeros_like(grpo_batch.completion_mask)
+                for row, turn_ids in enumerate(turn_boundaries):
+                    if not turn_ids:
+                        raise ValueError(f'Missing assistant-turn token boundaries for sample {row}.')
+                    completion_indices = grpo_batch.completion_mask[row].nonzero(as_tuple=True)[0]
+                    first_turn_length = len(turn_ids[0])
+                    first_turn_mask[row, completion_indices[:first_turn_length]] = 1
+                grpo_batch.advantages = (
+                    grpo_batch.advantages
+                    + route_advantages.unsqueeze(-1) * first_turn_mask
+                )
             if grpo_batch.branch_token_mask is not None:
                 grpo_batch.advantages = grpo_batch.advantages.masked_fill(grpo_batch.branch_token_mask, 0.0)
             if grpo_batch.teacher_per_token_logps is not None:
@@ -518,7 +546,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self._metrics[mode]['routing/direct_rate'].append(direct_mask.float().mean().item())
         self._metrics[mode]['routing/one_tool_rate'].append((call_counts == 1).float().mean().item())
         self._metrics[mode]['routing/two_plus_tool_rate'].append((call_counts >= 2).float().mean().item())
-
         grouped_tool = None
         mixed = None
         if not self.dynamic_num_samples and num_generations > 1 and call_counts.numel() % num_generations == 0:
@@ -647,6 +674,21 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         advantage_rewards_per_func, conditional_indices = self._condition_rewards_for_advantage(
             rewards_per_func, utility_info, num_generations)
 
+        advantage_reward_weights = self.reward_weights
+        route_advantage = None
+        if os.environ.get('UTILITY_DECOUPLE_ROUTE_ADVANTAGE', '0') == '1':
+            route_index = next(
+                (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityRouteReward'), None)
+            if route_index is None:
+                raise ValueError(
+                    'UTILITY_DECOUPLE_ROUTE_ADVANTAGE=1 requires utility_route in reward_funcs.')
+            advantage_reward_weights = self.reward_weights.clone()
+            advantage_reward_weights[route_index] = 0.0
+            route_advantage = torch.nan_to_num(
+                rewards_per_func[:, route_index], nan=0.0) * self.reward_weights[route_index]
+
+        self._decoupled_route_advantages = route_advantage
+
         # Keep weighted rewards for the request-aware (multi-turn) path below.
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
         if self.kl_in_reward and self.beta != 0.0:
@@ -658,7 +700,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if not self.dynamic_num_samples:
             advantages, weighted_rewards = compute_advantages(
                 rewards_per_func=advantage_rewards_per_func,
-                reward_weights=self.reward_weights,
+                reward_weights=advantage_reward_weights,
                 num_generations=num_generations,
                 advantage_estimator=self.advantage_estimator,
                 scale_rewards=self.scale_rewards,
@@ -666,6 +708,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 beta=self.beta,
                 kl_values=kl_values,
             )
+
+            if route_advantage is not None:
+                weighted_rewards = weighted_rewards + route_advantage
+                self._metrics[mode]['routing/uncentered_route_advantage_mean'].append(
+                    route_advantage.mean().item())
+                self._metrics[mode]['routing/uncentered_route_advantage_std'].append(
+                    route_advantage.std().item() if route_advantage.numel() > 1 else 0.0)
 
             reward_metrics = compute_reward_metrics(
                 rewards=weighted_rewards,
@@ -720,7 +769,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             advantages, _ = compute_advantages_dynamic(
                 rewards_per_func=rewards_per_func,
-                reward_weights=self.reward_weights,
+                reward_weights=advantage_reward_weights,
                 prompt_ids=prompt_ids,
                 request_ids=request_ids,
                 advantage_estimator=self.advantage_estimator,
@@ -729,6 +778,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 beta=self.beta,
                 kl_values=kl_values,
             )
+
+            if route_advantage is not None:
+                self._metrics[mode]['routing/uncentered_route_advantage_mean'].append(
+                    route_advantage.mean().item())
+                self._metrics[mode]['routing/uncentered_route_advantage_std'].append(
+                    route_advantage.std().item() if route_advantage.numel() > 1 else 0.0)
 
             # Metrics are logged on request-deduplicated rewards.
             unique_indices = self._get_last_indices(request_ids)
