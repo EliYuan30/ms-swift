@@ -541,7 +541,12 @@ class RolloutOutput(BaseModel):
                 if not isinstance(values, list):
                     values = [values]
                 for i, value in enumerate(values):
-                    values[i] = MultiModalRequestMixin.to_base64(value)
+                    if key == 'videos' and isinstance(value, (list, tuple)):
+                        values[i] = [
+                            MultiModalRequestMixin.to_base64(frame) for frame in value
+                        ]
+                    else:
+                        values[i] = MultiModalRequestMixin.to_base64(value)
                 self.rollout_infos[key] = values
 
 

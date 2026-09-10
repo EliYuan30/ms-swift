@@ -451,10 +451,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         return total_rewards_per_func
 
     def _gather_utility_rollout_info(self, samples: List[GRPOSample]) -> Optional[List[Dict[str, Any]]]:
-        if not any(getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
+        utility_scheduler = getattr(self.args, 'multi_turn_scheduler', None) in {
+            'utility_visual_tool', 'utility_visual_tool_drop'
+        }
+        if not utility_scheduler and not any(
+                getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
             return None
 
-        from tool_rewards import CROP_TOOL, SELECT_TOOL, parse_tool_metadata
+        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_tool_bbox, parse_tool_metadata, tool_iou_metrics
 
         local_info = []
         for sample in samples:
@@ -481,7 +485,35 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 and call.get('success', True)
                 and call.get('name') in expected_tools
             ]
+            natural_calls = [call for call in sampled_calls if not call.get('injected', False)]
+            info = sample.rollout_infos or {}
+            crop_calls = [call for call in natural_calls if call.get('name') == CROP_TOOL]
+            crop_areas = [
+                bbox_area_ratio(box) for call in crop_calls if call.get('success', True)
+                and (box := parse_tool_bbox((call.get('arguments') or {}).get('bbox_2d'))) is not None
+            ]
             local_info.append({
+                'request_id': sample.request_id,
+                'prompt_id': sample.prompt_id or sample.request_id,
+                'modality': sample.get_tag('teacher_route') or ('video' if preferred_tool == SELECT_TOOL else 'image'),
+                'gate_candidate_ious': [call['gate_candidate_iou'] for call in calls
+                                       if call.get('gate_eligible') and call.get('gate_candidate_iou') is not None],
+                'crop_areas': crop_areas,
+                'crop_count': len(crop_calls),
+                'crop_removed_count': sum(bool(call.get('crop_on_removed_original')) for call in crop_calls),
+                'invalid_reasons': info.get('output_invalid_reasons', []),
+                'turn_count': info.get('training_turn_count', info.get('num_turns', 1)),
+                'boundary_truncated_turns': info.get('tool_call_boundary_truncated_turns', 0),
+                'retokenized_turns': info.get('tool_call_retokenized_turns', 0),
+                'logprob_turns': info.get('trajectory_rollout_logprob_turns',
+                                        sum(bool(values) for values in (sample.rollout_logprobs or []))),
+                'gate_eligible_count': sum(bool(call.get('gate_eligible')) for call in calls),
+                'gate_replaced_count': sum(bool(call.get('gate_eligible') and call.get('injected')) for call in calls),
+                'tool_ious': tool_iou_metrics(metadata, natural_calls),
+                'called_tools': [call.get('name') for call in natural_calls],
+                'drop_selected': (sample.rollout_infos or {}).get('original_vision_drop_selected'),
+                'execution_count': len(calls),
+                'execution_failure_count': sum(not call.get('success', True) for call in calls),
                 'tool_call_count': len(sampled_calls),
                 'evidence_tool_call_count': len(evidence_calls),
                 'tool_applicable': metadata.get('tool_applicable'),
@@ -537,6 +569,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if utility_info is None:
             return
 
+        if self.dynamic_num_samples:
+            last_indices = {}
+            for index, info in enumerate(utility_info):
+                last_indices[info['request_id']] = index
+            indices = sorted(last_indices.values())
+            utility_info = [utility_info[index] for index in indices]
+            rewards_per_func = rewards_per_func[indices]
+            advantages = advantages[indices]
+
         mode = 'train' if self.model.training else 'eval'
         device = rewards_per_func.device
         call_counts = torch.tensor(
@@ -553,6 +594,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             mixed = grouped_tool.any(dim=1) & ~grouped_tool.all(dim=1)
             self._metrics[mode]['routing/mixed_group_rate'].append(mixed.float().mean().item())
 
+        if self.dynamic_num_samples and num_generations > 1:
+            groups = {}
+            for index, info in enumerate(utility_info):
+                groups.setdefault(info['prompt_id'], []).append(index)
+            group_masks = [tool_mask[indices] for indices in groups.values() if len(indices) > 1]
+            if group_masks:
+                self._metrics[mode]['routing/mixed_group_rate'].append(
+                    sum(bool(mask.any() and not mask.all()) for mask in group_masks) / len(group_masks))
+
         for label, expected in (('applicable', True), ('not_applicable', False), ('unknown', None)):
             subset = torch.tensor(
                 [info['tool_applicable'] is expected for info in utility_info], dtype=torch.bool, device=device)
@@ -567,8 +617,78 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     self._metrics[mode][f'routing/tool_rate/{field}/{label}'].append(
                         tool_mask[subset].float().mean().item())
 
+        eligible = sum(info['gate_eligible_count'] for info in utility_info)
+        replaced = sum(info['gate_replaced_count'] for info in utility_info)
+        self._metrics[mode]['gate/eligible_decisions'].append(eligible)
+        self._metrics[mode]['gate/replaced_decisions'].append(replaced)
+        if eligible:
+            self._metrics[mode]['gate/replacement_rate'].append(replaced / eligible)
+        self._metrics[mode]['gate/replaced_trajectory_rate'].append(
+            sum(info['gate_replaced_count'] > 0 for info in utility_info) / len(utility_info))
+
+        for modality in ('image', 'video'):
+            subset = [info for info in utility_info if info['modality'] == modality]
+            count = sum(info['gate_eligible_count'] for info in subset)
+            self._metrics[mode][f'gate/eligible_decisions/{modality}'].append(count)
+            if count:
+                self._metrics[mode][f'gate/replacement_rate/{modality}'].append(
+                    sum(info['gate_replaced_count'] for info in subset) / count)
+            ious = [value for info in subset for value in info['gate_candidate_ious']]
+            if ious:
+                self._metrics[mode][f'gate/threshold_band_rate/{modality}'].append(
+                    sum(0.45 <= value <= 0.65 for value in ious) / len(ious))
+
+        for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
+                       'trailing_text', 'unbalanced_tool_response', 'length'):
+            self._metrics[mode][f'invalid/{reason}_rate'].append(
+                sum(reason in info['invalid_reasons'] for info in utility_info) / len(utility_info))
+        turn_count = sum(info['turn_count'] for info in utility_info)
+        for metric, field in (('boundary_truncated_rate', 'boundary_truncated_turns'),
+                              ('retokenized_rate', 'retokenized_turns'),
+                              ('logprob_turn_available_rate', 'logprob_turns')):
+            self._metrics[mode][f'rollout/{metric}'].append(
+                sum(info[field] for info in utility_info) / turn_count)
+        crop_count = sum(info['crop_count'] for info in utility_info)
+        if crop_count:
+            self._metrics[mode]['tools/crop_on_removed_original_rate'].append(
+                sum(info['crop_removed_count'] for info in utility_info) / crop_count)
+        areas = [area for info in utility_info for area in info['crop_areas']]
+        if areas:
+            self._metrics[mode]['tools/crop_source_area_ge_0_4_rate'].append(
+                sum(area >= 0.4 for area in areas) / len(areas))
+            for quantile, value in zip(('p10', 'p50', 'p90'),
+                                       torch.tensor(areas).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()):
+                self._metrics[mode][f'tools/crop_source_area_{quantile}'].append(value)
+
+        from tool_rewards import CROP_TOOL, SELECT_TOOL
+        for label, name in (('crop', CROP_TOOL), ('select', SELECT_TOOL)):
+            values = [info['tool_ious'][label] for info in utility_info if info['tool_ious'][label] is not None]
+            called_values = [info['tool_ious'][label] for info in utility_info
+                             if info['tool_ious'][label] is not None and name in info['called_tools']]
+            if values:
+                self._metrics[mode][f'tools/{label}_iou'].append(sum(values) / len(values))
+            if called_values:
+                self._metrics[mode][f'tools/{label}_iou_called'].append(sum(called_values) / len(called_values))
+                for quantile, value in zip(('p10', 'p50', 'p90'),
+                                           torch.tensor(called_values).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist()):
+                    self._metrics[mode][f'tools/{label}_iou_called_{quantile}'].append(value)
+        executions = sum(info['execution_count'] for info in utility_info)
+        if executions:
+            self._metrics[mode]['tools/execution_failure_rate'].append(
+                sum(info['execution_failure_count'] for info in utility_info) / executions)
+
         correctness_index = next(
             (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
+        for label, selected in (('drop_selected', True), ('drop_not_selected', False)):
+            subset = torch.tensor([info['drop_selected'] is selected for info in utility_info],
+                                  dtype=torch.bool, device=device)
+            if subset.any():
+                self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
+                if rewards_per_func.shape[1] > 0:
+                    self._metrics[mode][f'routing/advantage/{label}'].append(advantages[subset].mean().item())
+                if correctness_index is not None:
+                    self._metrics[mode][f'routing/correctness/{label}'].append(
+                        rewards_per_func[subset, correctness_index].mean().item())
         if correctness_index is not None:
             correctness = rewards_per_func[:, correctness_index]
             if direct_mask.any():
@@ -590,10 +710,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     self._metrics[mode]['routing/tool_better_group_rate'].append((deltas > 0).float().mean().item())
                     self._metrics[mode]['routing/direct_better_group_rate'].append((deltas < 0).float().mean().item())
                     self._metrics[mode]['routing/equal_group_rate'].append((deltas == 0).float().mean().item())
-        if direct_mask.any():
-            self._metrics[mode]['routing/advantage/direct'].append(advantages[direct_mask].mean().item())
-        if tool_mask.any():
-            self._metrics[mode]['routing/advantage/tool'].append(advantages[tool_mask].mean().item())
+        if rewards_per_func.shape[1] > 0:
+            if direct_mask.any():
+                self._metrics[mode]['routing/advantage/direct'].append(advantages[direct_mask].mean().item())
+            if tool_mask.any():
+                self._metrics[mode]['routing/advantage/tool'].append(advantages[tool_mask].mean().item())
 
     def _compute_advantages(self, samples: List[GRPOSample], rewards_per_func: torch.Tensor,
                             batch_encoded_inputs: List[Dict[str, Any]]) -> torch.Tensor:
@@ -1071,6 +1192,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         template = self.template
         gas_chunks = self.split_by_mini_batches(samples)
         ga_batch_encoded_inputs: List[Dict[str, Any]] = []
+        trajectory_count = None
+        if self.dynamic_num_samples and any(gather_object([
+                any('training_turn_count' in (s.rollout_infos or {}) for s in samples)])):
+            if self.loss_type not in {'grpo', 'sapo'}:
+                raise ValueError('Turn-split trajectory normalization requires grpo or sapo loss.')
+            local_count = sum(1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in samples)
+            trajectory_count = sum(gather_object([local_count]))
         for batch in gas_chunks:
             teacher_model_inputs = teacher_grpo_batch = None
             with self._template_context(template):
@@ -1080,6 +1208,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     s.encoded = encoded_inputs
                 model_inputs, grpo_batch = collate_to_grpo_micro_batch(
                     batch, template, device=self.accelerator.device, use_logits_to_keep=True)
+                if trajectory_count is not None:
+                    # Undo turn duplication and microbatch/DDP means before gradient accumulation.
+                    grpo_batch.sequence_loss_weights = torch.tensor(
+                        [1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in batch],
+                        device=self.accelerator.device,
+                    ) * (len(batch) * len(gas_chunks) * self.accelerator.num_processes / trajectory_count)
                 # OPSD: the local teacher forwards its own (teacher_prompt + same response)
                 # encoding, so collate a separate teacher micro-batch (different length).
                 has_opsd_batch = build_opsd_samples(batch)
@@ -1131,6 +1265,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         # --- log completion lengths ---
         mode = 'train' if self.model.training else 'eval'
+        logprob_available = gather_object([
+            inp['grpo_batch'].rollout_per_token_logps is not None for inp in ga_batch_encoded_inputs])
+        self._metrics[mode]['rollout/logprob_microbatch_available_rate'].append(
+            sum(logprob_available) / len(logprob_available))
         device = self.accelerator.device
         local_lengths = [inp['grpo_batch'].completion_mask.sum(1).tolist() for inp in ga_batch_encoded_inputs]
         total_lengths = self._gather_and_flatten(local_lengths, dtype=torch.float32, device=device, flatten_level=1)
@@ -1423,7 +1561,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if self.loss_type in ['grpo', 'sapo']:
             # completion_mask is now always [batch_size, seq_len] after pad_back
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            sequence_loss = (per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            if grpo_batch.sequence_loss_weights is not None:
+                sequence_loss = sequence_loss * grpo_batch.sequence_loss_weights
+            loss = sequence_loss.mean()
         elif self.loss_type == 'bnpo':
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == 'dr_grpo':
@@ -2400,6 +2541,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                                        if grpo_batch.completion_turn_token_ids is not None else None),
             advantages=grpo_batch.advantages[start_idx:end_idx] if grpo_batch.advantages is not None else None,
             num_items_in_batch=grpo_batch.num_items_in_batch,
+            sequence_loss_weights=(grpo_batch.sequence_loss_weights[start_idx:end_idx]
+                                   if grpo_batch.sequence_loss_weights is not None else None),
             logits_to_keep=grpo_batch.logits_to_keep,
         )
 

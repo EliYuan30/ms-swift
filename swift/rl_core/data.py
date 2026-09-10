@@ -223,8 +223,12 @@ class OnPolicySample:
         # rollout logprobs (for importance sampling); keep nested [turn][token]
         if rollout_output.rollout_logprobs:
             self.rollout_logprobs = rollout_output.rollout_logprobs
-        elif choice.logprobs is not None and 'content' in choice.logprobs:
+        elif not return_by_scheduler and choice.logprobs is not None and 'content' in choice.logprobs:
             self.rollout_logprobs = [[item['logprob'] for item in choice.logprobs['content']]]
+        else:
+            # Empty scheduler logprobs deliberately disable correction; the final
+            # choice's logprobs cannot substitute for a multi-turn trajectory.
+            self.rollout_logprobs = []
 
         self.finish_reason = choice.finish_reason
         self.add_eos = False
@@ -328,6 +332,7 @@ class GRPOBatch:
     completion_turn_token_ids: Optional[List[List[List[int]]]] = None
     advantages: Optional[torch.Tensor] = None  # [B, T] per-token (base broadcast minus per-token teacher KL)
     num_items_in_batch: Optional[torch.Tensor] = None  # scalar
+    sequence_loss_weights: Optional[torch.Tensor] = None  # [B], turn-split trajectory normalization
     logits_to_keep: Optional[int] = None
 
     def to_device(self, device) -> 'GRPOBatch':
