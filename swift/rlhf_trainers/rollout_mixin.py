@@ -1139,13 +1139,15 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         # Generate first turn with actual questions
         first_turn_rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
 
-        return self._colocate_multi_turn_infer(samples, first_turn_rollout_outputs, request_config, requests)
+        return self._colocate_multi_turn_infer(samples, first_turn_rollout_outputs, request_config, requests,
+                                               is_global_inputs)
 
     def _colocate_multi_turn_infer(self,
                                    samples: List[OnPolicySample],
                                    first_turn_rollout_outputs: List[RolloutOutput],
                                    request_config: RequestConfig,
-                                   requests: Optional[List] = None) -> List[OnPolicySample]:
+                                   requests: Optional[List] = None,
+                                   is_global_inputs: bool = False) -> List[OnPolicySample]:
         if requests is None:
             requests = self.samples2requests(samples)
         rollout_outputs = run_multi_turn(
@@ -1157,6 +1159,30 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             max_turns=self.args.max_turns,
             gather_fn=gather_object,
         )
+        # Colocate drives individual hooks, so it does not pass through scheduler.run().
+        finalize_rollout = getattr(self.multi_turn_scheduler, 'finalize_rollout', None)
+        if finalize_rollout is not None:
+            finalized_outputs = []
+            for request, output in zip(requests, rollout_outputs):
+                # Synchronous engines reuse batch-local response ids; restore the trajectory
+                # identity before one trajectory is split into several training samples.
+                output.response.id = request.uuid
+                result = finalize_rollout(request, request_config, output)
+                finalized_outputs.extend(result if isinstance(result, list) else [result])
+            rollout_outputs = finalized_outputs
+
+        self.dynamic_num_samples = any(gather_object([len(rollout_outputs) != len(samples)]))
+        if self.dynamic_num_samples:
+            if self.template.padding_free:
+                raise NotImplementedError('Padding free mode is not supported for dynamic sample')
+            if is_global_inputs:
+                raise NotImplementedError(
+                    'async_generate / prefetch already holds the global batch on one rank, so a '
+                    'trajectory-splitting scheduler cannot be re-partitioned here. Disable '
+                    'async_generate for per-turn-split multi-turn training.')
+            # Match the partition used by reward/advantage gathering in the server path.
+            rollout_outputs = self._sort_by_request_id(gather_object(rollout_outputs))
+            rollout_outputs = get_even_process_data(self, rollout_outputs)
         return self._postprocess_rollout_outputs(samples, rollout_outputs)
 
     def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
