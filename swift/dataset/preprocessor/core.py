@@ -289,6 +289,8 @@ class RowPreprocessor:
                         'bbox_type': Value(dtype='string'),
                         'image_id': Sequence(feature=Value(dtype='int64'), length=-1),
                     }
+                for key, feature in getattr(self, 'arrow_feature_overrides', {}).items():
+                    features[key] = feature
             ArrowWriter.__origin_init__(_self, schema, features, *args, **kwargs)
 
         ArrowWriter.__origin_init__ = ArrowWriter.__init__

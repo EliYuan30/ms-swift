@@ -89,6 +89,19 @@ if is_swanlab_available():
     import swanlab
 
 
+def _select_final_trajectory_rows(table):
+    # Split states share rewards; only terminal states belong in completion tables.
+    if 'training_turn_index' not in table:
+        return table
+    last_rows = {}
+    for i, (index, count, request_id) in enumerate(zip(
+            table['training_turn_index'], table['training_turn_count'], table['request_id'])):
+        if index == count - 1:
+            last_rows[request_id if request_id else i] = i
+    indices = sorted(last_rows.values())
+    return {key: [values[i] for i in indices] for key, values in table.items()}
+
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -368,7 +381,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             #          add them to metrics_to_gather
             # NOTE: every key you register must appear in ALL rollout outputs
             #       to avoid potential communication / synchronization issues
-            metrics_for_logs_to_gather = {}
+            metrics_for_logs_to_gather = {
+                'request_id': [s.request_id for s in samples],
+                'training_turn_index': [(s.rollout_infos or {}).get('training_turn_index', 0) for s in samples],
+                'training_turn_count': [(s.rollout_infos or {}).get('training_turn_count', 1) for s in samples],
+            }
 
             if all('solution' in s.extra for s in samples):
                 metrics_for_logs_to_gather['solution'] = [s.extra['solution'] for s in samples]
@@ -2387,6 +2404,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             report_to_swanlab = self.args.report_to and 'swanlab' in self.args.report_to and swanlab_get_run(
             ) is not None
 
+            table = _select_final_trajectory_rows(table)
             self.jsonl_writer.append(table)
 
             if report_to_wandb:
@@ -2395,13 +2413,19 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 # Create a copy to avoid modifying the original table used by other loggers.
                 wandb_table = table.copy()
                 if self._logs.get('image'):
+                    image_rows = {
+                        'image': list(self._logs['image'])[:seen_nums],
+                        **{key: list(self._logs[key])[:seen_nums]
+                           for key in ('request_id', 'training_turn_index', 'training_turn_count')},
+                    }
                     wandb_table['image'] = [
-                        wandb.Image(load_pil_img(img)) if img is not None else None for img in self._logs['image']
+                        wandb.Image(load_pil_img(img)) if img is not None else None
+                        for img in _select_final_trajectory_rows(image_rows)['image']
                     ]
                 df = pd.DataFrame(wandb_table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=['prompt'])
-                wandb.log({'completions': wandb.Table(dataframe=df)}, step=self.state.global_step)
+                wandb.log({'completions': wandb.Table(dataframe=df), 'train/global_step': self.state.global_step})
 
             if report_to_swanlab:
                 headers = list(table.keys())

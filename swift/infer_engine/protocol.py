@@ -262,7 +262,9 @@ class MultiModalRequestMixin:
     objects: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
-    def to_base64(mm_data: Union[str, Image.Image, bytes]) -> str:
+    def to_base64(
+        mm_data: Union[str, Image.Image, bytes], *, as_data_uri: bool = False
+    ) -> str:
         if isinstance(mm_data, dict) and 'bytes' in mm_data:
             mm_data = mm_data['bytes'] or mm_data['path']
         if isinstance(mm_data, str) and not os.path.isfile(mm_data):
@@ -279,7 +281,7 @@ class MultiModalRequestMixin:
         else:
             bytes_ = mm_data
         img_base64: str = base64.b64encode(bytes_).decode('utf-8')
-        return img_base64
+        return f'data:image;base64,{img_base64}' if as_data_uri else img_base64
 
     def __post_init__(self):
         for key in ['images', 'audios', 'videos']:
@@ -543,7 +545,8 @@ class RolloutOutput(BaseModel):
                 for i, value in enumerate(values):
                     if key == 'videos' and isinstance(value, (list, tuple)):
                         values[i] = [
-                            MultiModalRequestMixin.to_base64(frame) for frame in value
+                            MultiModalRequestMixin.to_base64(frame, as_data_uri=True)
+                            for frame in value
                         ]
                     else:
                         values[i] = MultiModalRequestMixin.to_base64(value)
