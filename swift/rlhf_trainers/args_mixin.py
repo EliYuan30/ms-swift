@@ -364,6 +364,10 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
         log_rollout_offpolicy_metrics (bool): Whether to log rollout off-policy diagnostic metrics (KL, PPL, chi2, etc.)
             when `rollout_importance_sampling_mode` is not set. When `rollout_importance_sampling_mode` is set,
             metrics are always logged regardless of this setting. Defaults to False.
+        offload_ref_model (bool): Keep the frozen reference on CPU outside rollout scoring. Supports unsharded
+            reference models with full-model GRPO and ZeRO stages 0-2. Defaults to False.
+        mask_positive_invalid_final_advantages (bool): Cap positive advantages of invalid terminal states at zero
+            for the utility_visual_tool_drop scheduler, without changing earlier tool states. Defaults to False.
     """
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
@@ -397,6 +401,8 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     sync_ref_model: bool = False
     ref_model_sync_steps: int = 512
     ref_model_mixup_alpha: float = 0.6
+    offload_ref_model: bool = False
+    mask_positive_invalid_final_advantages: bool = False
 
     # multi turn
     multi_turn_scheduler: Optional[str] = None

@@ -139,7 +139,8 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         """
         samples = self._rollout_samples(inputs)
         samples = self._score_completions(samples)
-        batch_encoded_inputs = self._prepare_batch_inputs(samples)
+        with self.reference_scoring_context():
+            batch_encoded_inputs = self._prepare_batch_inputs(samples)
         self._postprocess_batch(samples, batch_encoded_inputs)
         self._log_rollout(samples)
         return batch_encoded_inputs

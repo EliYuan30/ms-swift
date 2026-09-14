@@ -102,6 +102,15 @@ def _select_final_trajectory_rows(table):
     return {key: [values[i] for i in indices] for key, values in table.items()}
 
 
+def _guard_invalid_final_advantages(advantages, rollout_infos):
+    # Invalid terminal states must not inherit positive reinforcement from tool rewards.
+    invalid = torch.tensor([
+        info['training_turn_index'] == info['training_turn_count'] - 1
+        and bool(info['output_invalid_reasons']) for info in rollout_infos
+    ], device=advantages.device, dtype=torch.bool)
+    return torch.where(invalid, advantages.clamp(max=0), advantages), invalid
+
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -128,6 +137,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         reward_templates = kwargs.pop('reward_template', None)
         # Teacher kwargs (same set as GKD; setting one turns GRPO into OPD-RL: teacher KL as advantage).
         self._pop_teacher_kwargs(kwargs)
+        if args.mask_positive_invalid_final_advantages and (
+                args.multi_turn_scheduler != 'utility_visual_tool_drop' or self._has_teacher_explicit()):
+            raise ValueError('Invalid-final advantage protection requires utility_visual_tool_drop without a teacher.')
         self._prepare_algorithm_params()
         super().__init__(model, ref_model, *_args, **kwargs)
         self._prepare_chord_dataset()
@@ -260,6 +272,23 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._assemble_teacher_api_logps(samples, batch_encoded_inputs)
         total_advantages = self._compute_advantages(samples, self._rewards_per_func, batch_encoded_inputs)
         total_route_advantages = self._decoupled_route_advantages
+        if getattr(self.args, 'mask_positive_invalid_final_advantages', False) and self.model.training:
+            if any(gather_object([any(item['grpo_batch'].teacher_per_token_logps is not None
+                                      for item in batch_encoded_inputs)])):
+                raise ValueError('Invalid-final advantage protection does not support teacher-signal batches.')
+            infos = gather_object([
+                {key: s.rollout_infos[key] for key in
+                 ('training_turn_index', 'training_turn_count', 'output_invalid_reasons')} for s in samples
+            ])
+            guarded_advantages, invalid = _guard_invalid_final_advantages(total_advantages, infos)
+            invalid_advantages = total_advantages[invalid]
+            for label, selected in (('positive', invalid_advantages > 0), ('negative', invalid_advantages < 0),
+                                    ('zero', invalid_advantages == 0)):
+                self._metrics['train'][f'invalid_final/{label}_advantage_rate_before_guard'].append(
+                    selected.float().mean().item() if invalid_advantages.numel() else 0.0)
+            self._metrics['train']['invalid_final/positive_advantage_rate_after_guard'].append(
+                (guarded_advantages[invalid] > 0).float().mean().item() if invalid_advantages.numel() else 0.0)
+            total_advantages = guarded_advantages
 
         local_advantages = get_even_process_data(self, total_advantages)
         local_route_advantages = (
@@ -529,6 +558,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'tool_ious': tool_iou_metrics(metadata, natural_calls),
                 'called_tools': [call.get('name') for call in natural_calls],
                 'drop_selected': (sample.rollout_infos or {}).get('original_vision_drop_selected'),
+                'drop_applied': info.get('trajectory_original_vision_dropped', info.get('original_vision_dropped')),
                 'execution_count': len(calls),
                 'execution_failure_count': sum(not call.get('success', True) for call in calls),
                 'tool_call_count': len(sampled_calls),
@@ -659,6 +689,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                        'trailing_text', 'unbalanced_tool_response', 'length'):
             self._metrics[mode][f'invalid/{reason}_rate'].append(
                 sum(reason in info['invalid_reasons'] for info in utility_info) / len(utility_info))
+        groups = defaultdict(list)
+        for info in utility_info:
+            groups[info['prompt_id']].append(bool(info['invalid_reasons']))
+        self._metrics[mode]['invalid/all_invalid_group_rate'].append(
+            sum(all(values) for values in groups.values()) / len(groups))
         turn_count = sum(info['turn_count'] for info in utility_info)
         for metric, field in (('boundary_truncated_rate', 'boundary_truncated_turns'),
                               ('retokenized_rate', 'retokenized_turns'),
@@ -696,6 +731,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         correctness_index = next(
             (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
+        for label, applied in (('drop_applied', True), ('drop_not_applied', False)):
+            subset = torch.tensor([info['drop_applied'] is applied for info in utility_info],
+                                  dtype=torch.bool, device=device)
+            if subset.any():
+                length_invalid = torch.tensor(['length' in info['invalid_reasons'] for info in utility_info],
+                                              dtype=torch.float, device=device)
+                self._metrics[mode][f'invalid/length_rate/{label}'].append(length_invalid[subset].mean().item())
+                if correctness_index is not None:
+                    self._metrics[mode][f'routing/correctness/{label}'].append(
+                        rewards_per_func[subset, correctness_index].mean().item())
         for label, selected in (('drop_selected', True), ('drop_not_selected', False)):
             subset = torch.tensor([info['drop_selected'] is selected for info in utility_info],
                                   dtype=torch.bool, device=device)
@@ -1212,8 +1257,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         trajectory_count = None
         if self.dynamic_num_samples and any(gather_object([
                 any('training_turn_count' in (s.rollout_infos or {}) for s in samples)])):
-            if self.loss_type not in {'grpo', 'sapo'}:
-                raise ValueError('Turn-split trajectory normalization requires grpo or sapo loss.')
+            if self.loss_type not in {'grpo', 'sapo', 'dr_grpo'}:
+                raise ValueError('Turn-split trajectory normalization requires grpo, sapo or dr_grpo loss.')
             local_count = sum(1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in samples)
             trajectory_count = sum(gather_object([local_count]))
         for batch in gas_chunks:
@@ -1576,17 +1621,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             off_policy_seq_mask_expanded = off_policy_seq_mask.unsqueeze(-1).expand_as(completion_mask)
             completion_mask = completion_mask & off_policy_seq_mask_expanded
 
-        if self.loss_type in ['grpo', 'sapo']:
+        if self.loss_type in ['grpo', 'sapo', 'dr_grpo']:
             # completion_mask is now always [batch_size, seq_len] after pad_back
-            sequence_loss = (per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
+            denominator = (self.max_completion_length if self.loss_type == 'dr_grpo'
+                           else completion_mask.sum(-1).clamp(min=1.0))
+            sequence_loss = (per_token_loss * completion_mask).sum(-1) / denominator
             if grpo_batch.sequence_loss_weights is not None:
                 sequence_loss = sequence_loss * grpo_batch.sequence_loss_weights
             loss = sequence_loss.mean()
         elif self.loss_type == 'bnpo':
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        elif self.loss_type == 'dr_grpo':
-            batch_size = completion_mask.shape[0]
-            loss = (per_token_loss * completion_mask).sum() / (batch_size * self.max_completion_length)
         elif self.loss_type == 'real':
             global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
 
@@ -1842,9 +1886,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         cispo_clip_values = []
         entropy_thresholds = []
         fipo_values = {}
+        rollout_values = {}
 
         for chunk_metrics, chunk_weight in all_metrics_data:
             chunk_tokens = chunk_metrics['completion_token_count']
+            for key, value in chunk_metrics.get('rollout_correction', {}).items():
+                weight = chunk_tokens if key in {'kl', 'k3_kl', 'chi2_token', 'is_weight_mean'} else chunk_weight
+                weight = weight.item() if hasattr(weight, 'item') else weight
+                rollout_values.setdefault(key, []).append((value, weight))
 
             # Collect entropy metrics
             if chunk_metrics['entropy']:
@@ -1920,6 +1969,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if fipo_values:
             aggregated_metrics['fipo'] = {key: weighted_avg(values) for key, values in fipo_values.items()}
+        if rollout_values:
+            aggregated_metrics['rollout_correction'] = {
+                key: (max(value for value, _ in values) if key.endswith('_max')
+                      else min(value for value, _ in values) if key.endswith('_min') else weighted_avg(values))
+                for key, values in rollout_values.items()
+            }
 
         # Update metrics
         self._update_metrics(aggregated_metrics)
@@ -1978,7 +2033,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         entropies = None
         per_token_logps, _ = GatherLoss.apply(per_token_logps, labels, 1, position_ids)
         if compute_entropy:
-            entropies = entropy_from_logits(logits)
+            entropies = entropy_from_logits(logits.detach())
             entropies, _ = GatherLoss.apply(entropies, labels, 1, position_ids)
 
         if self.template.padding_free:
@@ -2079,14 +2134,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             # Compute entropy if needed
             if compute_entropy:
-                entropies = entropy_from_logits(logits_rmpad)  # [total_nnz]
+                entropies = entropy_from_logits(logits_rmpad.detach())  # [total_nnz]
                 entropies = entropies.unsqueeze(0)  # [1, total_nnz]
             else:
                 entropies = None
         else:
             logps = selective_log_softmax(logits, input_ids_for_logps)
             if compute_entropy:
-                entropies = entropy_from_logits(logits)
+                entropies = entropy_from_logits(logits.detach())
             else:
                 entropies = None
 
@@ -2344,7 +2399,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     def offload_context(self):
         if self.args.offload_model:
             self.offload_model(self.accelerator.unwrap_model(self.model))
-            if self.ref_model:
+            if self.ref_model and not getattr(self.args, 'offload_ref_model', False):
                 self.offload_model(self.ref_model)
         if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
             self.offload_optimizer()
@@ -2355,7 +2410,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # reload (load back) model when exiting context
             if self.args.offload_model:
                 self.load_model(self.accelerator.unwrap_model(self.model))
-                if self.ref_model:
+                if self.ref_model and not getattr(self.args, 'offload_ref_model', False):
                     self.load_model(self.ref_model)
             if getattr(self, 'optimizer', None) and self.args.offload_optimizer:
                 self.load_optimizer()
@@ -2376,12 +2431,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             super().log(logs)
         self._metrics[mode].clear()
 
-        # - entropy only includes samples that went through training (computed in _compute_loss)
-        # - Other fields (e.g., prompt/completion/reward) are collected from rollout (in _prepare_inputs)
-        # Therefore, if entropy exists, to ensure length consistency across fields,
-        # we align all data based on the number of samples in entropy.
-        seen_nums = len(self._logs['entropy']) \
-            if 'entropy' in self._logs else len(self._logs['prompt'])
+        # Chunk/DDP entropy order differs from rollout order for split trajectories.
+        # Keep scalar entropy diagnostics, but never attach misaligned row values.
+        entropy_rows = 'entropy' in self._logs and not self.dynamic_num_samples
+        seen_nums = len(self._logs['entropy']) if entropy_rows else len(self._logs['prompt'])
         if self.accelerator.is_main_process and self.log_completions:
             table = {
                 'step': [str(self.state.global_step)] * seen_nums,
@@ -2394,10 +2447,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'advantages': list(self._logs['advantages'])[:seen_nums],
             }
             for key, value in self._logs.items():
-                if key not in table and key not in ['image', 'rewards']:
+                if key not in table and key not in ['image', 'rewards', 'entropy']:
                     table[key] = list(value)[:seen_nums]
 
-            if self.args.log_entropy:
+            if entropy_rows:
                 table.update({'entropy': list(self._logs['entropy'])[:seen_nums]})
 
             report_to_wandb = self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None
@@ -2965,7 +3018,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         - log_ppl_diff: Difference in log perplexities
         - ppl_ratio: Ratio of training PPL to rollout PPL
         - chi2_token: Token-level χ² divergence E[ρ²] - 1
-        - chi2_seq: Sequence-level χ² divergence E[(∏ρ_t)²] - 1
+        - chi2_seq: Mean squared geometric-mean token ratio minus one (not a sequence χ² divergence)
 
         Args:
             per_token_logps: Log probs from training policy model, shape [B, T]

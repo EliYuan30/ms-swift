@@ -47,8 +47,16 @@ class RLHFTrainerMixin:
         super().__init__(model, *_args, **kwargs)
         self.aux_loss_enabled = model.model_info.is_moe_model and args.router_aux_loss_coef > 0
         self.aux_loss_coef = args.router_aux_loss_coef
+        if getattr(args, 'offload_ref_model', False):
+            if ref_model is None or self.beta <= 0:
+                raise ValueError('offload_ref_model requires an explicit frozen reference and positive beta.')
+            if getattr(args, 'sync_ref_model', False) or self.is_fsdp_enabled or (
+                    self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.zero_stage == 3):
+                raise ValueError('offload_ref_model requires a fixed, unsharded reference (no FSDP/ZeRO-3).')
         if ref_model is not None:
-            if self.is_deepspeed_enabled:
+            if getattr(args, 'offload_ref_model', False):
+                self.ref_model = self.ref_model.requires_grad_(False).eval().to('cpu')
+            elif self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             elif self.is_fsdp_enabled:
                 from .utils import prepare_fsdp
@@ -57,6 +65,17 @@ class RLHFTrainerMixin:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         self.padding_value = self.tokenizer.pad_token_id
+
+    @contextmanager
+    def reference_scoring_context(self):
+        offloaded = getattr(self.args, 'offload_ref_model', False)
+        try:
+            if offloaded:
+                self.ref_model.to(self.accelerator.device)
+            yield
+        finally:
+            if offloaded:
+                self.ref_model.to('cpu')
 
     def create_loss_and_eval_metric(self, args):
         return {}

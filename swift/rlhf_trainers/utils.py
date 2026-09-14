@@ -1995,11 +1995,13 @@ def build_rollout_logps(
     rollout_per_token_logps = torch.zeros(batch_size, seq_len, dtype=torch.float32, device=device)
     for i, nested_lp in enumerate(lp_list):
         flat_lps = [lp for turn_lps in nested_lp for lp in turn_lps]
+        completion_count = int(completion_mask[i].sum().item())
         if not flat_lps:
+            if completion_count:
+                return None
             continue
         if any(lp is None for lp in flat_lps):
             return None
-        completion_count = int(completion_mask[i].sum().item())
         if len(flat_lps) == completion_count + 1:
             flat_lps = flat_lps[:completion_count]
         if len(flat_lps) != completion_count:
