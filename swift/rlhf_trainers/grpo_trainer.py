@@ -682,8 +682,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     sum(info['gate_replaced_count'] for info in subset) / count)
             ious = [value for info in subset for value in info['gate_candidate_ious']]
             if ious:
+                from tool_rewards import MIN_BRANCH_IOU
                 self._metrics[mode][f'gate/threshold_band_rate/{modality}'].append(
-                    sum(0.45 <= value <= 0.65 for value in ious) / len(ious))
+                    sum(abs(value - MIN_BRANCH_IOU) <= 0.1 + 1e-9 for value in ious) / len(ious))
 
         for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
                        'trailing_text', 'unbalanced_tool_response', 'length'):
