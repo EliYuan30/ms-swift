@@ -873,6 +873,27 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         self._decoupled_route_advantages = route_advantage
 
+        # Original-vision-drop decoupled baseline: the drop coin is exogenous
+        # and invisible to the policy at decision time, but with a single
+        # whole-group baseline the harder (dropped) trajectories are compared
+        # against the easier (kept) ones, so every token of a drop trajectory
+        # receives a systematic negative advantage offset and vice versa
+        # (measured at ~+/-0.09 mean advantage on the 20260916 image run).
+        # With UTILITY_DROP_GROUP_ADVANTAGE=1 the baseline (group mean and
+        # group std) is instead computed within (prompt x coin) subgroups, so
+        # crop quality is compared against peers under the same condition.
+        # Trajectories whose subgroup has no counterfactual (size < 2) get
+        # zero advantage.
+        drop_group_flags = None
+        if (self.model.training and utility_info is not None
+                and os.environ.get('UTILITY_DROP_GROUP_ADVANTAGE', '0') == '1'):
+            raw_drop_flags = [info.get('drop_selected') for info in utility_info]
+            if any(flag is not None for flag in raw_drop_flags):
+                drop_group_flags = torch.tensor([bool(flag) for flag in raw_drop_flags],
+                                                dtype=torch.bool, device=rewards_per_func.device)
+                if drop_group_flags.numel() != rewards_per_func.shape[0]:
+                    raise ValueError('Gathered drop flags do not align with gathered rewards.')
+
         # Keep weighted rewards for the request-aware (multi-turn) path below.
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
         if self.kl_in_reward and self.beta != 0.0:
@@ -891,7 +912,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 kl_in_reward=self.kl_in_reward,
                 beta=self.beta,
                 kl_values=kl_values,
+                subgroup_flags=drop_group_flags,
             )
+
+            if drop_group_flags is not None:
+                flags_grouped = drop_group_flags.view(-1, num_generations)
+                true_counts = flags_grouped.sum(dim=1, keepdim=True)
+                member_counts = torch.where(flags_grouped, true_counts,
+                                            num_generations - true_counts)
+                self._metrics[mode]['routing/drop_subgroup_singleton_rate'].append(
+                    (member_counts < 2).float().mean().item())
 
             if route_advantage is not None:
                 weighted_rewards = weighted_rewards + route_advantage
@@ -951,6 +981,26 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 if not torch.allclose(rewards[idxs], rewards[idxs[0]].expand(len(idxs)), atol=1e-6):
                     raise ValueError(f'Inconsistent rewards detected for request_id={rid}.')
 
+            if drop_group_flags is not None:
+                # The coin is per trajectory; every expanded round row of a
+                # request must carry the same flag or the subgroup baseline
+                # would be ill-defined.
+                flag_by_request: Dict[str, bool] = {}
+                for i, rid in enumerate(request_ids):
+                    value = bool(drop_group_flags[i].item())
+                    if flag_by_request.setdefault(rid, value) != value:
+                        raise ValueError(f'Inconsistent drop flags detected for request_id={rid}.')
+                subgroup_sizes: Dict[Any, int] = {}
+                request_keys = {}
+                for i, rid in enumerate(request_ids):
+                    if rid not in request_keys:
+                        request_keys[rid] = (prompt_ids[i], flag_by_request[rid])
+                for key in request_keys.values():
+                    subgroup_sizes[key] = subgroup_sizes.get(key, 0) + 1
+                singleton = sum(1 for key in request_keys.values() if subgroup_sizes[key] < 2)
+                self._metrics[mode]['routing/drop_subgroup_singleton_rate'].append(
+                    singleton / max(len(request_keys), 1))
+
             advantages, _ = compute_advantages_dynamic(
                 rewards_per_func=rewards_per_func,
                 reward_weights=advantage_reward_weights,
@@ -961,6 +1011,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 kl_in_reward=self.kl_in_reward,
                 beta=self.beta,
                 kl_values=kl_values,
+                subgroup_flags=drop_group_flags,
             )
 
             if route_advantage is not None:

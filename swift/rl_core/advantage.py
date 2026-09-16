@@ -26,6 +26,64 @@ def center_rewards_within_masked_groups(
     return torch.where(active, grouped_rewards - means, torch.zeros_like(grouped_rewards)).view(-1)
 
 
+def _subgroup_centered_advantages(
+    rewards: torch.Tensor,
+    subgroup_flags: torch.Tensor,
+    num_generations: int,
+    advantage_estimator: str,
+    scale_rewards: str,
+) -> torch.Tensor:
+    """Center rewards within (prompt group x flag) subgroups.
+
+    Used when an exogenous per-trajectory condition (e.g. the original-vision
+    drop coin) changes task difficulty: with a single whole-group baseline,
+    identical behaviour under the harder condition is systematically assigned
+    negative advantage and the easier condition positive advantage, so the
+    coin's luck leaks into every token of the trajectory. Splitting the
+    baseline by the flag removes that cross-condition transfer while keeping
+    within-condition comparisons intact.
+
+    Members of subgroups smaller than 2 have no counterfactual and receive
+    zero advantage. With ``scale_rewards='group'`` the std is computed within
+    the same subgroup (unbiased, matching ``torch.std``).
+    """
+    if advantage_estimator not in ('grpo', 'rloo'):
+        raise ValueError(
+            f'subgroup_flags is not supported with advantage_estimator={advantage_estimator!r}')
+    if scale_rewards == 'gdpo':
+        raise ValueError('subgroup_flags is not supported with scale_rewards="gdpo"')
+    if rewards.numel() % num_generations != 0:
+        raise ValueError('reward count must be divisible by num_generations')
+    if subgroup_flags.shape != rewards.shape:
+        raise ValueError('subgroup_flags and rewards must be aligned 1-D tensors')
+
+    grouped = rewards.view(-1, num_generations)
+    flags = subgroup_flags.bool().view(-1, num_generations)
+    advantages = torch.zeros_like(grouped)
+    stds = torch.zeros_like(grouped) if scale_rewards == 'group' else None
+    for flag_value in (True, False):
+        member = flags if flag_value else ~flags
+        counts = member.sum(dim=1, keepdim=True)
+        means = grouped.masked_fill(~member, 0.0).sum(dim=1, keepdim=True) / counts.clamp(min=1)
+        centered = grouped - means
+        if advantage_estimator == 'rloo':
+            k = counts.float()
+            centered = centered * (k / (k - 1).clamp(min=1))
+        active = member & (counts > 1)
+        advantages = torch.where(active, centered, advantages)
+        if stds is not None:
+            variances = (grouped - means).pow(2).masked_fill(~member, 0.0).sum(
+                dim=1, keepdim=True) / (counts - 1).clamp(min=1)
+            stds = torch.where(active, variances.sqrt().expand_as(grouped), stds)
+    flat = advantages.reshape(-1)
+    if scale_rewards == 'batch':
+        std = rewards.std().expand_as(rewards) if rewards.numel() > 1 else torch.zeros_like(rewards)
+        flat = flat / (std + 1e-4)
+    elif stds is not None:
+        flat = flat / (stds.reshape(-1) + 1e-4)
+    return flat
+
+
 def compute_advantages(
     rewards_per_func: torch.Tensor,
     reward_weights: torch.Tensor,
@@ -35,6 +93,7 @@ def compute_advantages(
     kl_in_reward: bool = False,
     beta: float = 0.0,
     kl_values: Optional[torch.Tensor] = None,
+    subgroup_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute advantages from per-function rewards.
 
@@ -60,6 +119,11 @@ def compute_advantages(
         kl_in_reward: Subtract ref model KL from rewards (pre-normalization).
         beta: Ref model KL penalty coefficient.
         kl_values: ``[N]`` ref model KL values (required when ``kl_in_reward=True``).
+        subgroup_flags: Optional ``[N]`` bool tensor. When given, the group
+            baseline (mean and, for ``scale_rewards='group'``, std) is computed
+            within (prompt group x flag) subgroups; subgroup members without a
+            counterfactual (subgroup size < 2) get zero advantage. Only
+            supported for the ``grpo`` and ``rloo`` estimators.
 
     Returns:
         ``(advantages, rewards)`` both ``[N]``.
@@ -68,6 +132,11 @@ def compute_advantages(
 
     if kl_in_reward and beta != 0.0 and kl_values is not None:
         rewards = rewards - beta * kl_values
+
+    if subgroup_flags is not None:
+        advantages = _subgroup_centered_advantages(
+            rewards, subgroup_flags, num_generations, advantage_estimator, scale_rewards)
+        return advantages, rewards
 
     K = num_generations
     grouped = rewards.view(-1, K)
@@ -118,6 +187,7 @@ def compute_advantages_dynamic(
     kl_in_reward: bool = False,
     beta: float = 0.0,
     kl_values: Optional[torch.Tensor] = None,
+    subgroup_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Request-aware advantage computation for dynamic sample counts.
 
@@ -141,6 +211,11 @@ def compute_advantages_dynamic(
         kl_in_reward: Subtract ref model KL from rewards (pre-normalization).
         beta: Ref model KL penalty coefficient.
         kl_values: ``[N]`` ref model KL values.
+        subgroup_flags: Optional ``[N]`` bool tensor aligned with
+            ``request_ids`` (duplicated rows must carry identical flags). When
+            given, groups are formed by ``(prompt_id, flag)`` instead of
+            ``prompt_id`` alone; singleton subgroups get zero advantage. Only
+            supported for the ``grpo`` and ``rloo`` estimators.
 
     Returns:
         ``(advantages, rewards)`` both ``[N]`` (with duplicate entries for repeated request_ids).
@@ -151,6 +226,13 @@ def compute_advantages_dynamic(
     if kl_in_reward and beta != 0.0 and kl_values is not None:
         rewards = rewards - beta * kl_values
 
+    if subgroup_flags is not None:
+        if advantage_estimator not in ('grpo', 'rloo'):
+            raise ValueError(
+                f'subgroup_flags is not supported with advantage_estimator={advantage_estimator!r}')
+        if subgroup_flags.shape[0] != len(request_ids):
+            raise ValueError('subgroup_flags must align with request_ids')
+
     # Deduplicate by request_id (keep last occurrence)
     seen = {}
     for idx, rid in enumerate(request_ids):
@@ -160,10 +242,16 @@ def compute_advantages_dynamic(
     unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
     unique_rewards = rewards[unique_indices]
 
-    # Group by prompt_id
+    unique_flags = None
+    if subgroup_flags is not None:
+        flags_bool = subgroup_flags.bool()
+        unique_flags = [bool(flags_bool[i].item()) for i in unique_indices.cpu()]
+
+    # Group by prompt_id (or by (prompt_id, flag) when subgroup_flags is given)
     prompt_to_indices: Dict[str, List[int]] = {}
     for idx, pid in enumerate(unique_prompt_ids):
-        prompt_to_indices.setdefault(pid, []).append(idx)
+        key = (pid, unique_flags[idx]) if unique_flags is not None else pid
+        prompt_to_indices.setdefault(key, []).append(idx)
 
     prompt_means = torch.zeros(len(unique_rewards), device=device)
     for pid, idxs in prompt_to_indices.items():
