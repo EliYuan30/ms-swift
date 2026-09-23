@@ -504,7 +504,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
             return None
 
-        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_tool_bbox, parse_tool_metadata, tool_iou_metrics
+        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_crop_boxes, parse_tool_metadata, tool_iou_metrics
 
         local_info = []
         for sample in samples:
@@ -536,7 +536,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             crop_calls = [call for call in natural_calls if call.get('name') == CROP_TOOL]
             crop_areas = [
                 bbox_area_ratio(box) for call in crop_calls if call.get('success', True)
-                and (box := parse_tool_bbox((call.get('arguments') or {}).get('bbox_2d'))) is not None
+                for box in (parse_crop_boxes(call.get('arguments') or {}) or [])
             ]
             local_info.append({
                 'request_id': sample.request_id,
