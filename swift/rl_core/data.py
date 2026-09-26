@@ -181,9 +181,9 @@ class OnPolicySample:
         ``chat_template_kwargs`` (the only dataset-passthrough column encode
         consumes — drives enable_thinking / max_pixels / reasoning_effort) +
         add_eos. Other ``extra`` columns (solution/target/...) are reward-only
-        and intentionally excluded from encode. Response tokens are already
-        injected into ``messages`` via ``replace_assistant_response_with_ids``
-        before encoding.
+        and intentionally excluded from encode. Sampled response token IDs are NOT
+        injected here; encode through ``encode_sample`` (which applies
+        ``replace_assistant_response_with_ids``) so training sees the sampled tokens.
         """
         d = self._standard_fields()
         chat_template_kwargs = self.extra.get('chat_template_kwargs')

@@ -561,6 +561,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'drop_applied': info.get('trajectory_original_vision_dropped', info.get('original_vision_dropped')),
                 'execution_count': len(calls),
                 'execution_failure_count': sum(not call.get('success', True) for call in calls),
+                'execution_infra_error_count': sum(bool(call.get('infra_error')) for call in calls),
                 'tool_call_count': len(sampled_calls),
                 'evidence_tool_call_count': len(evidence_calls),
                 'tool_applicable': metadata.get('tool_applicable'),
@@ -729,6 +730,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if executions:
             self._metrics[mode]['tools/execution_failure_rate'].append(
                 sum(info['execution_failure_count'] for info in utility_info) / executions)
+            self._metrics[mode]['tools/execution_infra_error_rate'].append(
+                sum(info.get('execution_infra_error_count', 0) for info in utility_info) / executions)
 
         correctness_index = next(
             (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
@@ -804,26 +807,32 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 Computed advantages, shape `(N,)`.
         """
 
-        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
+        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor,
+                                group_ids: Optional[List[Any]] = None):
             """Log reward statistics for monitoring. Only log once per unique request_id."""
             # rewards: [prompt_batch_size, num_generations]
             # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
             mode = 'train' if self.model.training else 'eval'
             num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
-            group_rewards = rewards.view(-1, num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
+            if group_ids is None:
+                group_rewards = rewards.view(-1, num_generations)
+                group_means = group_rewards.mean(-1)
+                group_stds = group_rewards.std(-1) if num_generations > 1 else torch.zeros_like(group_means)
+            else:
+                # Request-aware rows are ordered by random request id, not by prompt, so
+                # consecutive-row views would mix prompts; group by prompt id explicitly.
+                members: Dict[Any, List[int]] = {}
+                for i, group_id in enumerate(group_ids):
+                    members.setdefault(group_id, []).append(i)
+                groups = [rewards[idxs] for idxs in members.values()]
+                group_means = torch.stack([g.mean() for g in groups])
+                group_stds = torch.stack([g.std() if g.numel() > 1 else g.new_zeros(()) for g in groups])
+            rewards_mean = group_means.mean().item()
             if self.scale_rewards in ['group', 'none', 'gdpo']:
-                # Handle edge case when num_generations_eval=1
-                if num_generations > 1:
-                    rewards_std = group_rewards.std(-1).mean().item()
-                else:
-                    rewards_std = 0.0
+                rewards_std = group_stds.mean().item()
             elif self.scale_rewards == 'batch':
                 rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
-            if num_generations > 1:
-                is_std_zero = torch.isclose(group_rewards.std(dim=1), torch.zeros_like(group_rewards.std(dim=1)))
-            else:
-                is_std_zero = torch.ones(group_rewards.size(0), dtype=torch.bool, device=group_rewards.device)
+            is_std_zero = torch.isclose(group_stds, torch.zeros_like(group_stds))
 
             self._metrics[mode]['reward'].append(rewards_mean)
             self._metrics[mode]['reward_std'].append(rewards_std)
@@ -1024,7 +1033,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Metrics are logged on request-deduplicated rewards.
             unique_indices = self._get_last_indices(request_ids)
             log_rewards_metrics(
-                rewards=rewards[unique_indices], rewards_per_func_for_metrics=rewards_per_func[unique_indices])
+                rewards=rewards[unique_indices],
+                rewards_per_func_for_metrics=rewards_per_func[unique_indices],
+                group_ids=[prompt_ids[i] for i in unique_indices.tolist()])
             self._log_utility_routing_metrics(
                 utility_info, rewards_per_func, advantages, num_generations)
             log_rewards_all(rewards_per_func)
@@ -2682,9 +2693,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             template = self.template
             current_length = model_inputs['input_ids'].shape[1]
             with self._template_context(template):
-                encoded_data = [template.encode(data.to_template_dict()) for data in chunk_origin_data]
-                for ed in encoded_data:
-                    ed.pop('_extra_kwargs', None)
+                # Reuse the encoding built from the sampled response token IDs. Re-encoding
+                # the decoded text can shift tokens (stripped whitespace, dropped <|im_end|>)
+                # while masks, old/ref/rollout logps and advantages keep the original layout.
+                encoded_data = []
+                for data in chunk_origin_data:
+                    encoded = dict(data.encoded) if data.encoded is not None else encode_sample(data, template)
+                    encoded.pop('_extra_kwargs', None)
+                    encoded_data.append(encoded)
                 chunk_model_inputs.update(
                     to_device(template.data_collator(encoded_data, padding_to=current_length), self.accelerator.device))
                 chunk_model_inputs.pop('labels', None)
@@ -3212,11 +3228,19 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # 2. Compute Effective Sample Size (ESS) for IS weights
         # ESS = 1 / E[(w_i / E[w_i])²] (using clamped weights for stability)
         # This measures how many "effective" independent samples we have after IS weighting
-        weights_for_ess = is_weights.clamp(min=threshold_lower, max=threshold)
-        mean_for_ess = masked_mean(weights_for_ess, completion_mask)
-        is_weights_normalized = weights_for_ess / (mean_for_ess + 1e-8)  # Avoid division by zero
-        ess = 1.0 / masked_mean(is_weights_normalized.square(), completion_mask).clamp(min=1e-10)
-        metrics['ess'] = self.accelerator.gather_for_metrics(ess).nanmean().item()
+        weights_for_ess = is_weights.detach().clamp(min=threshold_lower, max=threshold)
+        if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
+            ess_weights, ess_mask = weights_for_ess, completion_mask.float()
+        else:
+            # Sequence-level weights are constant within a row: count each sequence once.
+            ess_mask = completion_mask.any(-1).float()
+            ess_weights = (weights_for_ess * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1)
+        # A chunk often holds one sequence, whose normalized ESS is identically 1, so
+        # pool the moments over all ranks: ESS = (sum w)^2 / (n * sum w^2).
+        moments = torch.stack([(ess_weights * ess_mask).sum(), (ess_weights.square() * ess_mask).sum(),
+                               ess_mask.sum()]).float()
+        s1, s2, n = self.accelerator.gather(moments.unsqueeze(0)).view(-1, 3).sum(0)
+        metrics['ess'] = (s1.square() / (n * s2)).item() if n > 0 else float('nan')
 
         # 3. Fraction of clipped/masked samples
         if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
