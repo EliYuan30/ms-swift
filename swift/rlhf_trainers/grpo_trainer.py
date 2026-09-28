@@ -111,6 +111,20 @@ def _guard_invalid_final_advantages(advantages, rollout_infos):
     return torch.where(invalid, advantages.clamp(max=0), advantages), invalid
 
 
+def _has_infra_error(rollout_infos):
+    return any(call.get('infra_error') for call in (rollout_infos or {}).get('tool_calls') or [])
+
+
+def _exclude_infra_error_groups(advantages, prompt_ids, infra_errors):
+    # A tool that failed for infrastructure reasons (media I/O, decoding) says nothing
+    # about the policy, yet it lowers that trajectory's reward and shifts the group's
+    # standardized advantages. Remove the reward signal of every row in such a group.
+    failed = {prompt_id for prompt_id, error in zip(prompt_ids, infra_errors) if error}
+    excluded = torch.tensor([prompt_id in failed for prompt_id in prompt_ids],
+                            device=advantages.device, dtype=torch.bool)
+    return torch.where(excluded, torch.zeros_like(advantages), advantages), excluded
+
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -289,6 +303,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._metrics['train']['invalid_final/positive_advantage_rate_after_guard'].append(
                 (guarded_advantages[invalid] > 0).float().mean().item() if invalid_advantages.numel() else 0.0)
             total_advantages = guarded_advantages
+        if self.model.training:
+            group_infos = gather_object([(s.prompt_id, _has_infra_error(s.rollout_infos)) for s in samples])
+            total_advantages, excluded = _exclude_infra_error_groups(
+                total_advantages, [prompt_id for prompt_id, _ in group_infos], [error for _, error in group_infos])
+            self._metrics['train']['tools/infra_error_excluded_row_rate'].append(excluded.float().mean().item())
+            if total_route_advantages is not None:
+                total_route_advantages = torch.where(
+                    excluded.view(-1, *([1] * (total_route_advantages.dim() - 1))),
+                    torch.zeros_like(total_route_advantages), total_route_advantages)
 
         local_advantages = get_even_process_data(self, total_advantages)
         local_route_advantages = (
@@ -1917,7 +1940,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 chunk_weight = 0
 
             # Compute loss and metrics for this chunk
-            chunk_loss, chunk_metrics_data = self._compute_loss_and_metrics(model, chunk_model_inputs, chunk_grpo_batch)
+            # A dummy chunk reruns the previous inputs only to keep collectives aligned;
+            # it must not add a second copy of that data to cross-rank IS metrics.
+            self._is_dummy_loss_chunk = is_dummy
+            try:
+                chunk_loss, chunk_metrics_data = self._compute_loss_and_metrics(
+                    model, chunk_model_inputs, chunk_grpo_batch)
+            finally:
+                self._is_dummy_loss_chunk = False
 
             if not is_dummy:
                 losses.append(chunk_loss * chunk_weight)
@@ -3211,7 +3241,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         metrics = {}
         SAFETY_BOUND = 20.0
         threshold = self.rollout_importance_sampling_threshold
-        threshold_lower = 1.0 / threshold  # Default lower threshold (reciprocal of upper)
 
         # Helper function for masked mean
         def masked_mean(x, mask):
@@ -3222,13 +3251,16 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         is_ratio = torch.exp(log_ratio_safe)
 
         # 1. IS weight statistics
+        dummy = getattr(self, '_is_dummy_loss_chunk', False)
         mean_is_weight = masked_mean(is_weights, completion_mask)
+        if dummy:
+            mean_is_weight = torch.full_like(mean_is_weight, float('nan'))
         metrics['is_weight_mean'] = self.accelerator.gather_for_metrics(mean_is_weight).nanmean().item()
 
         # 2. Compute Effective Sample Size (ESS) for IS weights
-        # ESS = 1 / E[(w_i / E[w_i])²] (using clamped weights for stability)
-        # This measures how many "effective" independent samples we have after IS weighting
-        weights_for_ess = is_weights.detach().clamp(min=threshold_lower, max=threshold)
+        # ESS = 1 / E[(w_i / E[w_i])²] over the weights the loss actually applies
+        # (already truncated/masked by the IS mode; no extra floor, which would inflate ESS).
+        weights_for_ess = is_weights.detach()
         if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
             ess_weights, ess_mask = weights_for_ess, completion_mask.float()
         else:
@@ -3239,8 +3271,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # pool the moments over all ranks: ESS = (sum w)^2 / (n * sum w^2).
         moments = torch.stack([(ess_weights * ess_mask).sum(), (ess_weights.square() * ess_mask).sum(),
                                ess_mask.sum()]).float()
+        if dummy:
+            moments = torch.zeros_like(moments)
         s1, s2, n = self.accelerator.gather(moments.unsqueeze(0)).view(-1, 3).sum(0)
-        metrics['ess'] = (s1.square() / (n * s2)).item() if n > 0 else float('nan')
+        if n == 0:
+            metrics['ess'] = float('nan')
+        else:
+            # Every weight masked to zero leaves no effective samples.
+            metrics['ess'] = (s1.square() / (n * s2)).item() if s2 > 0 else 0.0
 
         # 3. Fraction of clipped/masked samples
         if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
@@ -3249,11 +3287,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 clipped_frac = masked_mean((is_ratio > threshold).float(), completion_mask)
             else:  # token_mask
                 clipped_frac = masked_mean((is_weights == 0).float(), completion_mask)
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
             metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
         else:
             # Sequence-level (both truncate and mask)
             seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
             clipped_frac = (seq_ratios > threshold).float().mean()
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
             metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
 
         return metrics

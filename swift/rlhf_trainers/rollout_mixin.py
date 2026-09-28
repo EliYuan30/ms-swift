@@ -1272,10 +1272,15 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             # Messages only hold <image>/<video> placeholders, so the same question text
             # over different media must not share a GRPO group. Prefer the dataset row id;
             # otherwise fall back to media paths.
+            def media_identity(media):
+                # Videos may be nested frame lists; keep every path at any depth.
+                if isinstance(media, (list, tuple)):
+                    return [media_identity(item) for item in media]
+                return media if isinstance(media, str) else (media.get('path') if isinstance(media, dict) else None)
+
             identity = sample.extra.get('qid')
             if identity in (None, ''):
-                identity = [m if isinstance(m, str) else (m.get('path') if isinstance(m, dict) else None)
-                            for m in list(sample.images or []) + list(sample.videos or [])]
+                identity = media_identity(list(sample.images or []) + list(sample.videos or []))
             return json.dumps({'messages': sample.messages, 'identity': identity}, default=str)
 
         local_keys = [prompt_key(s) for s in samples]

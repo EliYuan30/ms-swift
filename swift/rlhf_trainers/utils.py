@@ -716,6 +716,7 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
     prefixes.
     """
     data = sample.to_template_dict()
+    history_as_text = False
     if sample.response_token_ids:
         loss_mask = sample.response_loss_mask or None
         msgs = data.get('messages')
@@ -726,14 +727,31 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
         prefix_ids = get_response_prefix_ids(template, sample_enable_thinking=sample_et)
         data['messages'] = replace_assistant_response_with_ids(
             msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids)
+        # Assistant turns left as strings (history not carried as sampled ids) are
+        # context only: never train on them.
+        for message in data['messages'] or []:
+            if message.get('role') == 'assistant' and isinstance(message.get('content'), str):
+                message['loss'] = False
+                history_as_text = True
 
     if encode_prompt_only:
         messages = data.get('messages', [])
         if messages and messages[-1].get('role') == 'assistant':
             data = {**data, 'messages': messages[:-1] + [{**messages[-1], 'content': None}]}
 
-    encoded = template.encode(data, return_length=True)
-    return encoded
+    loss_scale = getattr(template, 'loss_scale', None)
+    if not history_as_text or loss_scale is None or loss_scale.base_strategy == 'last_round':
+        return template.encode(data, return_length=True)
+    # Under a non-last-round strategy the training template keeps history thinking and
+    # prefixes every assistant round with the non-thinking prefix, whereas rollout
+    # (inference mode) only touches the last round. Render string history the rollout
+    # way; token-id turns keep their explicit loss_scale either way.
+    original_strategy = loss_scale.base_strategy
+    loss_scale.base_strategy = 'last_round'
+    try:
+        return template.encode(data, return_length=True)
+    finally:
+        loss_scale.base_strategy = original_strategy
 
 
 def replace_assistant_response_with_ids(messages: 'Messages',
@@ -2247,9 +2265,10 @@ def collate_to_grpo_micro_batch(
     non-Ray via batch forward, Ray by stacking per-sample remote results. No
     distributed communication happens here.
     """
-    encoded_list = [s.encoded for s in samples]
-    # Snapshot encode lengths before ``data_collator``: under Megatron CP it mutates each
-    # ``encoded`` in place, rounding ``length`` up to a multiple of ``cp_size * 2``.
+    # The collator pops per-sample fields (``image_grid_thw``, ``video_grid_thw``, ...) and,
+    # under Megatron CP, rewrites ``length``. Collate shallow copies so ``s.encoded`` stays
+    # complete for the multimodal loss chunks that re-collate it.
+    encoded_list = [dict(s.encoded) for s in samples]
     expected_lens = [e.get('length') for e in encoded_list]
     model_inputs = to_device(template.data_collator(encoded_list, padding_to=padding_to), device)
 
