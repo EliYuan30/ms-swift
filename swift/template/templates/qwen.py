@@ -628,7 +628,9 @@ class Qwen3_5Template(Qwen3VLTemplate):
             elif role == 'assistant':
                 # HF applies `|trim` and re-wraps the <think>...</think> block with canonical newlines.
                 stripped = content.strip()
-                if '</think>' in stripped and '<think>' in stripped:
+                # Like HF's template, a closing tag alone still delimits reasoning: bare
+                # generated text lacks the "<think>\n" that the generation prompt supplied.
+                if '</think>' in stripped:
                     before, _, after = stripped.partition('</think>')
                     reasoning = before.rstrip('\n').rsplit('<think>', 1)[-1].lstrip('\n').strip()
                     rest = after.lstrip('\n')
