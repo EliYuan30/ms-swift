@@ -701,6 +701,11 @@ def get_response_prefix_ids(template: Template, sample_enable_thinking: Optional
     return None
 
 
+def response_prefix_included(sample: OnPolicySample) -> bool:
+    """True only when a scheduler built the last turn's ids from text that kept the prompt prefix."""
+    return bool((sample.rollout_infos or {}).get('response_prefix_included'))
+
+
 def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_only: bool = False) -> Dict[str, Any]:
     """Encode a sample into a template.encode output dict.
 
@@ -726,7 +731,8 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
         sample_et = ctk.get('enable_thinking')
         prefix_ids = get_response_prefix_ids(template, sample_enable_thinking=sample_et)
         data['messages'] = replace_assistant_response_with_ids(
-            msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids)
+            msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids,
+            prefix_included=response_prefix_included(sample))
         # Assistant turns left as strings (history not carried as sampled ids) are
         # context only: never train on them.
         for message in data['messages'] or []:
@@ -757,7 +763,8 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
 def replace_assistant_response_with_ids(messages: 'Messages',
                                         completion_ids: List[Union[int, List[int]]],
                                         loss_mask: Optional[List[List[int]]] = None,
-                                        non_thinking_prefix_ids: Optional[List[int]] = None) -> 'Messages':  # noqa
+                                        non_thinking_prefix_ids: Optional[List[int]] = None,
+                                        prefix_included: bool = False) -> 'Messages':  # noqa
     """
     Replace assistant messages in a conversation with token IDs (and optional loss masks).
 
@@ -816,18 +823,16 @@ def replace_assistant_response_with_ids(messages: 'Messages',
     elif loss_mask:
         loss_mask = [list(mask) for mask in loss_mask]
 
-    # Inject the non-thinking prefix (e.g. '<think>\n\n</think>\n\n') into the LAST assistant turn.
-    # When enable_thinking false, the engine prepends non_thinking_prefix before generation
-    # so completion_ids here are generated with the non-thinking prefix, inject here
-    if non_thinking_prefix_ids:
+    # Inject the response prefix (e.g. '<think>\n' or '<think>\n\n</think>\n\n') into the LAST
+    # assistant turn: the generation prompt supplied it, so sampled ids never contain it.
+    # Whether ids already hold it is a property of their source (``prefix_included``), not of
+    # their first tokens: a model may itself sample the same tokens again after the prompt's.
+    if non_thinking_prefix_ids and not prefix_included:
         n_prefix = len(non_thinking_prefix_ids)
-        last_ids = list(completion_ids[-1])
-        # Skip if the response already starts with the prefix (avoid double injection).
-        if last_ids[:n_prefix] != list(non_thinking_prefix_ids):
-            if loss_mask is None:
-                loss_mask = [[1] * len(ids) for ids in completion_ids]
-            completion_ids[-1] = list(non_thinking_prefix_ids) + last_ids
-            loss_mask[-1] = [0] * n_prefix + list(loss_mask[-1])
+        if loss_mask is None:
+            loss_mask = [[1] * len(ids) for ids in completion_ids]
+        completion_ids[-1] = list(non_thinking_prefix_ids) + list(completion_ids[-1])
+        loss_mask[-1] = [0] * n_prefix + list(loss_mask[-1])
 
     if loss_mask:
         assert (

@@ -118,6 +118,10 @@ class OnPolicySample:
             d['chat_template_kwargs'] = chat_template_kwargs
         if self.response_token_ids:
             d['response_token_ids'] = self.response_token_ids
+            # The mask must travel with the ids: it marks non-sampled spans (earlier turns,
+            # observations, a source-included response prefix) the teacher must not score.
+            if self.response_loss_mask:
+                d['response_loss_mask'] = self.response_loss_mask
         d['add_eos'] = False
         return d
 
