@@ -711,7 +711,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     sum(abs(value - MIN_BRANCH_IOU) <= 0.1 + 1e-9 for value in ious) / len(ious))
 
         for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
-                       'trailing_text', 'unbalanced_tool_response', 'length'):
+                       'trailing_text', 'unbalanced_tool_response', 'repeated_text', 'length'):
             self._metrics[mode][f'invalid/{reason}_rate'].append(
                 sum(reason in info['invalid_reasons'] for info in utility_info) / len(utility_info))
         groups = defaultdict(list)
