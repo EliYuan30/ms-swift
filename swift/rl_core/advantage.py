@@ -230,8 +230,14 @@ def compute_advantages_dynamic(
         if advantage_estimator not in ('grpo', 'rloo'):
             raise ValueError(
                 f'subgroup_flags is not supported with advantage_estimator={advantage_estimator!r}')
-        if subgroup_flags.shape[0] != len(request_ids):
+        if scale_rewards == 'gdpo':
+            raise ValueError('subgroup_flags is not supported with scale_rewards="gdpo"')
+        if subgroup_flags.ndim != 1 or subgroup_flags.shape[0] != len(request_ids):
             raise ValueError('subgroup_flags must align with request_ids')
+        request_flags = {}
+        for rid, flag in zip(request_ids, subgroup_flags.bool().tolist()):
+            if request_flags.setdefault(rid, flag) != flag:
+                raise ValueError(f'Inconsistent drop flags detected for request_id={rid}.')
 
     # Deduplicate by request_id (keep last occurrence)
     seen = {}

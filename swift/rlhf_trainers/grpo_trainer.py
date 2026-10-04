@@ -111,6 +111,20 @@ def _guard_invalid_final_advantages(advantages, rollout_infos):
     return torch.where(invalid, advantages.clamp(max=0), advantages), invalid
 
 
+def _has_infra_error(rollout_infos):
+    return any(call.get('infra_error') for call in (rollout_infos or {}).get('tool_calls') or [])
+
+
+def _exclude_infra_error_groups(advantages, prompt_ids, infra_errors):
+    # A tool that failed for infrastructure reasons (media I/O, decoding) says nothing
+    # about the policy, yet it lowers that trajectory's reward and shifts the group's
+    # standardized advantages. Remove the reward signal of every row in such a group.
+    failed = {prompt_id for prompt_id, error in zip(prompt_ids, infra_errors) if error}
+    excluded = torch.tensor([prompt_id in failed for prompt_id in prompt_ids],
+                            device=advantages.device, dtype=torch.bool)
+    return torch.where(excluded, torch.zeros_like(advantages), advantages), excluded
+
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -289,6 +303,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._metrics['train']['invalid_final/positive_advantage_rate_after_guard'].append(
                 (guarded_advantages[invalid] > 0).float().mean().item() if invalid_advantages.numel() else 0.0)
             total_advantages = guarded_advantages
+        if self.model.training:
+            group_infos = gather_object([(s.prompt_id, _has_infra_error(s.rollout_infos)) for s in samples])
+            total_advantages, excluded = _exclude_infra_error_groups(
+                total_advantages, [prompt_id for prompt_id, _ in group_infos], [error for _, error in group_infos])
+            self._metrics['train']['tools/infra_error_excluded_row_rate'].append(excluded.float().mean().item())
+            if total_route_advantages is not None:
+                total_route_advantages = torch.where(
+                    excluded.view(-1, *([1] * (total_route_advantages.dim() - 1))),
+                    torch.zeros_like(total_route_advantages), total_route_advantages)
 
         local_advantages = get_even_process_data(self, total_advantages)
         local_route_advantages = (
@@ -504,7 +527,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
             return None
 
-        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_tool_bbox, parse_tool_metadata, tool_iou_metrics
+        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_crop_boxes, parse_tool_metadata, tool_iou_metrics
 
         local_info = []
         for sample in samples:
@@ -536,7 +559,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             crop_calls = [call for call in natural_calls if call.get('name') == CROP_TOOL]
             crop_areas = [
                 bbox_area_ratio(box) for call in crop_calls if call.get('success', True)
-                and (box := parse_tool_bbox((call.get('arguments') or {}).get('bbox_2d'))) is not None
+                for box in (parse_crop_boxes(call.get('arguments') or {}) or [])
             ]
             local_info.append({
                 'request_id': sample.request_id,
@@ -561,6 +584,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'drop_applied': info.get('trajectory_original_vision_dropped', info.get('original_vision_dropped')),
                 'execution_count': len(calls),
                 'execution_failure_count': sum(not call.get('success', True) for call in calls),
+                'execution_infra_error_count': sum(bool(call.get('infra_error')) for call in calls),
                 'tool_call_count': len(sampled_calls),
                 'evidence_tool_call_count': len(evidence_calls),
                 'tool_applicable': metadata.get('tool_applicable'),
@@ -687,7 +711,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     sum(abs(value - MIN_BRANCH_IOU) <= 0.1 + 1e-9 for value in ious) / len(ious))
 
         for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
-                       'trailing_text', 'unbalanced_tool_response', 'length'):
+                       'trailing_text', 'unbalanced_tool_response', 'repeated_text', 'length'):
             self._metrics[mode][f'invalid/{reason}_rate'].append(
                 sum(reason in info['invalid_reasons'] for info in utility_info) / len(utility_info))
         groups = defaultdict(list)
@@ -729,6 +753,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if executions:
             self._metrics[mode]['tools/execution_failure_rate'].append(
                 sum(info['execution_failure_count'] for info in utility_info) / executions)
+            self._metrics[mode]['tools/execution_infra_error_rate'].append(
+                sum(info.get('execution_infra_error_count', 0) for info in utility_info) / executions)
 
         correctness_index = next(
             (i for i, name in enumerate(self.reward_func_names) if name == 'UtilityCorrectnessReward'), None)
@@ -804,26 +830,32 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 Computed advantages, shape `(N,)`.
         """
 
-        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
+        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor,
+                                group_ids: Optional[List[Any]] = None):
             """Log reward statistics for monitoring. Only log once per unique request_id."""
             # rewards: [prompt_batch_size, num_generations]
             # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
             mode = 'train' if self.model.training else 'eval'
             num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
-            group_rewards = rewards.view(-1, num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
+            if group_ids is None:
+                group_rewards = rewards.view(-1, num_generations)
+                group_means = group_rewards.mean(-1)
+                group_stds = group_rewards.std(-1) if num_generations > 1 else torch.zeros_like(group_means)
+            else:
+                # Request-aware rows are ordered by random request id, not by prompt, so
+                # consecutive-row views would mix prompts; group by prompt id explicitly.
+                members: Dict[Any, List[int]] = {}
+                for i, group_id in enumerate(group_ids):
+                    members.setdefault(group_id, []).append(i)
+                groups = [rewards[idxs] for idxs in members.values()]
+                group_means = torch.stack([g.mean() for g in groups])
+                group_stds = torch.stack([g.std() if g.numel() > 1 else g.new_zeros(()) for g in groups])
+            rewards_mean = group_means.mean().item()
             if self.scale_rewards in ['group', 'none', 'gdpo']:
-                # Handle edge case when num_generations_eval=1
-                if num_generations > 1:
-                    rewards_std = group_rewards.std(-1).mean().item()
-                else:
-                    rewards_std = 0.0
+                rewards_std = group_stds.mean().item()
             elif self.scale_rewards == 'batch':
                 rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
-            if num_generations > 1:
-                is_std_zero = torch.isclose(group_rewards.std(dim=1), torch.zeros_like(group_rewards.std(dim=1)))
-            else:
-                is_std_zero = torch.ones(group_rewards.size(0), dtype=torch.bool, device=group_rewards.device)
+            is_std_zero = torch.isclose(group_stds, torch.zeros_like(group_stds))
 
             self._metrics[mode]['reward'].append(rewards_mean)
             self._metrics[mode]['reward_std'].append(rewards_std)
@@ -885,14 +917,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Trajectories whose subgroup has no counterfactual (size < 2) get
         # zero advantage.
         drop_group_flags = None
-        if (self.model.training and utility_info is not None
-                and os.environ.get('UTILITY_DROP_GROUP_ADVANTAGE', '0') == '1'):
+        if self.model.training and os.environ.get('UTILITY_DROP_GROUP_ADVANTAGE', '0') == '1':
+            if utility_info is None:
+                raise ValueError('Drop subgroup advantage requires gathered rollout drop flags.')
             raw_drop_flags = [info.get('drop_selected') for info in utility_info]
-            if any(flag is not None for flag in raw_drop_flags):
-                drop_group_flags = torch.tensor([bool(flag) for flag in raw_drop_flags],
-                                                dtype=torch.bool, device=rewards_per_func.device)
-                if drop_group_flags.numel() != rewards_per_func.shape[0]:
-                    raise ValueError('Gathered drop flags do not align with gathered rewards.')
+            if any(type(flag) is not bool for flag in raw_drop_flags):
+                raise ValueError('Drop subgroup advantage requires a boolean drop_selected on every rollout.')
+            drop_group_flags = torch.tensor(raw_drop_flags, dtype=torch.bool, device=rewards_per_func.device)
+            if drop_group_flags.numel() != rewards_per_func.shape[0]:
+                raise ValueError('Gathered drop flags do not align with gathered rewards.')
 
         # Keep weighted rewards for the request-aware (multi-turn) path below.
         rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
@@ -1023,7 +1056,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Metrics are logged on request-deduplicated rewards.
             unique_indices = self._get_last_indices(request_ids)
             log_rewards_metrics(
-                rewards=rewards[unique_indices], rewards_per_func_for_metrics=rewards_per_func[unique_indices])
+                rewards=rewards[unique_indices],
+                rewards_per_func_for_metrics=rewards_per_func[unique_indices],
+                group_ids=[prompt_ids[i] for i in unique_indices.tolist()])
             self._log_utility_routing_metrics(
                 utility_info, rewards_per_func, advantages, num_generations)
             log_rewards_all(rewards_per_func)
@@ -1905,7 +1940,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 chunk_weight = 0
 
             # Compute loss and metrics for this chunk
-            chunk_loss, chunk_metrics_data = self._compute_loss_and_metrics(model, chunk_model_inputs, chunk_grpo_batch)
+            # A dummy chunk reruns the previous inputs only to keep collectives aligned;
+            # it must not add a second copy of that data to cross-rank IS metrics.
+            self._is_dummy_loss_chunk = is_dummy
+            try:
+                chunk_loss, chunk_metrics_data = self._compute_loss_and_metrics(
+                    model, chunk_model_inputs, chunk_grpo_batch)
+            finally:
+                self._is_dummy_loss_chunk = False
 
             if not is_dummy:
                 losses.append(chunk_loss * chunk_weight)
@@ -2477,11 +2519,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             metrics = {f'eval_{key}': val for key, val in metrics.items()}
 
         logs.update(metrics)
-        if version.parse(transformers.__version__) >= version.parse('4.47.0.dev0'):
-            super().log(logs, start_time)
-        else:  # transformers<=4.46
-            super().log(logs)
-        self._metrics[mode].clear()
 
         # Chunk/DDP entropy order differs from rollout order for split trajectories.
         # Keep scalar entropy diagnostics, but never attach misaligned row values.
@@ -2530,7 +2567,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 df = pd.DataFrame(wandb_table)
                 if self.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=['prompt'])
-                wandb.log({'completions': wandb.Table(dataframe=df), 'train/global_step': self.state.global_step})
+                wandb.log({'completions': wandb.Table(dataframe=df)}, commit=False)
 
             if report_to_swanlab:
                 headers = list(table.keys())
@@ -2541,6 +2578,12 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         row.append(table[header][i])
                     rows.append(row)
                 swanlab.log({'completions': swanlab.echarts.Table().add(headers, rows)})
+
+        if version.parse(transformers.__version__) >= version.parse('4.47.0.dev0'):
+            super().log(logs, start_time)
+        else:  # transformers<=4.46
+            super().log(logs)
+        self._metrics[mode].clear()
 
     def is_async_generate_eval_rollout_done(self):
         return not self.eval_flag or not self.eval_queue.empty()
@@ -2680,9 +2723,14 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             template = self.template
             current_length = model_inputs['input_ids'].shape[1]
             with self._template_context(template):
-                encoded_data = [template.encode(data.to_template_dict()) for data in chunk_origin_data]
-                for ed in encoded_data:
-                    ed.pop('_extra_kwargs', None)
+                # Reuse the encoding built from the sampled response token IDs. Re-encoding
+                # the decoded text can shift tokens (stripped whitespace, dropped <|im_end|>)
+                # while masks, old/ref/rollout logps and advantages keep the original layout.
+                encoded_data = []
+                for data in chunk_origin_data:
+                    encoded = dict(data.encoded) if data.encoded is not None else encode_sample(data, template)
+                    encoded.pop('_extra_kwargs', None)
+                    encoded_data.append(encoded)
                 chunk_model_inputs.update(
                     to_device(template.data_collator(encoded_data, padding_to=current_length), self.accelerator.device))
                 chunk_model_inputs.pop('labels', None)
@@ -3193,7 +3241,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         metrics = {}
         SAFETY_BOUND = 20.0
         threshold = self.rollout_importance_sampling_threshold
-        threshold_lower = 1.0 / threshold  # Default lower threshold (reciprocal of upper)
 
         # Helper function for masked mean
         def masked_mean(x, mask):
@@ -3204,17 +3251,34 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         is_ratio = torch.exp(log_ratio_safe)
 
         # 1. IS weight statistics
+        dummy = getattr(self, '_is_dummy_loss_chunk', False)
         mean_is_weight = masked_mean(is_weights, completion_mask)
+        if dummy:
+            mean_is_weight = torch.full_like(mean_is_weight, float('nan'))
         metrics['is_weight_mean'] = self.accelerator.gather_for_metrics(mean_is_weight).nanmean().item()
 
         # 2. Compute Effective Sample Size (ESS) for IS weights
-        # ESS = 1 / E[(w_i / E[w_i])²] (using clamped weights for stability)
-        # This measures how many "effective" independent samples we have after IS weighting
-        weights_for_ess = is_weights.clamp(min=threshold_lower, max=threshold)
-        mean_for_ess = masked_mean(weights_for_ess, completion_mask)
-        is_weights_normalized = weights_for_ess / (mean_for_ess + 1e-8)  # Avoid division by zero
-        ess = 1.0 / masked_mean(is_weights_normalized.square(), completion_mask).clamp(min=1e-10)
-        metrics['ess'] = self.accelerator.gather_for_metrics(ess).nanmean().item()
+        # ESS = 1 / E[(w_i / E[w_i])²] over the weights the loss actually applies
+        # (already truncated/masked by the IS mode; no extra floor, which would inflate ESS).
+        weights_for_ess = is_weights.detach()
+        if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
+            ess_weights, ess_mask = weights_for_ess, completion_mask.float()
+        else:
+            # Sequence-level weights are constant within a row: count each sequence once.
+            ess_mask = completion_mask.any(-1).float()
+            ess_weights = (weights_for_ess * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1)
+        # A chunk often holds one sequence, whose normalized ESS is identically 1, so
+        # pool the moments over all ranks: ESS = (sum w)^2 / (n * sum w^2).
+        moments = torch.stack([(ess_weights * ess_mask).sum(), (ess_weights.square() * ess_mask).sum(),
+                               ess_mask.sum()]).float()
+        if dummy:
+            moments = torch.zeros_like(moments)
+        s1, s2, n = self.accelerator.gather(moments.unsqueeze(0)).view(-1, 3).sum(0)
+        if n == 0:
+            metrics['ess'] = float('nan')
+        else:
+            # Every weight masked to zero leaves no effective samples.
+            metrics['ess'] = (s1.square() / (n * s2)).item() if s2 > 0 else 0.0
 
         # 3. Fraction of clipped/masked samples
         if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
@@ -3223,11 +3287,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 clipped_frac = masked_mean((is_ratio > threshold).float(), completion_mask)
             else:  # token_mask
                 clipped_frac = masked_mean((is_weights == 0).float(), completion_mask)
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
             metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
         else:
             # Sequence-level (both truncate and mask)
             seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
             clipped_frac = (seq_ratios > threshold).float().mean()
+            if dummy:
+                clipped_frac = torch.full_like(clipped_frac, float('nan'))
             metrics['clipped_frac'] = self.accelerator.gather_for_metrics(clipped_frac).nanmean().item()
 
         return metrics

@@ -118,6 +118,10 @@ class OnPolicySample:
             d['chat_template_kwargs'] = chat_template_kwargs
         if self.response_token_ids:
             d['response_token_ids'] = self.response_token_ids
+            # The mask must travel with the ids: it marks non-sampled spans (earlier turns,
+            # observations, a source-included response prefix) the teacher must not score.
+            if self.response_loss_mask:
+                d['response_loss_mask'] = self.response_loss_mask
         d['add_eos'] = False
         return d
 
@@ -181,9 +185,9 @@ class OnPolicySample:
         ``chat_template_kwargs`` (the only dataset-passthrough column encode
         consumes — drives enable_thinking / max_pixels / reasoning_effort) +
         add_eos. Other ``extra`` columns (solution/target/...) are reward-only
-        and intentionally excluded from encode. Response tokens are already
-        injected into ``messages`` via ``replace_assistant_response_with_ids``
-        before encoding.
+        and intentionally excluded from encode. Sampled response token IDs are NOT
+        injected here; encode through ``encode_sample`` (which applies
+        ``replace_assistant_response_with_ids``) so training sees the sampled tokens.
         """
         d = self._standard_fields()
         chat_template_kwargs = self.extra.get('chat_template_kwargs')

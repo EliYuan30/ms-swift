@@ -1268,18 +1268,32 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         if not samples:
             return samples
 
-        all_messages = gather_object([s.messages for s in samples])
+        def prompt_key(sample):
+            # Messages only hold <image>/<video> placeholders, so the same question text
+            # over different media must not share a GRPO group. Prefer the dataset row id;
+            # otherwise fall back to media paths.
+            def media_identity(media):
+                # Videos may be nested frame lists; keep every path at any depth.
+                if isinstance(media, (list, tuple)):
+                    return [media_identity(item) for item in media]
+                return media if isinstance(media, str) else (media.get('path') if isinstance(media, dict) else None)
+
+            identity = sample.extra.get('qid')
+            if identity in (None, ''):
+                identity = media_identity(list(sample.images or []) + list(sample.videos or []))
+            return json.dumps({'messages': sample.messages, 'identity': identity}, default=str)
+
+        local_keys = [prompt_key(s) for s in samples]
         messages_to_prompt_id = {}
         prompt_id_counter = 0
 
-        for messages in all_messages:
-            key = json.dumps(messages)
+        for key in gather_object(local_keys):
             if key not in messages_to_prompt_id:
                 messages_to_prompt_id[key] = f'prompt_{prompt_id_counter}'
                 prompt_id_counter += 1
 
-        for s in samples:
-            s.prompt_id = messages_to_prompt_id[json.dumps(s.messages)]
+        for s, key in zip(samples, local_keys):
+            s.prompt_id = messages_to_prompt_id[key]
             s.request_id = f'chatcmpl-{str(uuid.uuid4().hex)}'
 
         return samples

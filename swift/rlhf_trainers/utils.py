@@ -701,6 +701,11 @@ def get_response_prefix_ids(template: Template, sample_enable_thinking: Optional
     return None
 
 
+def response_prefix_included(sample: OnPolicySample) -> bool:
+    """True only when a scheduler built the last turn's ids from text that kept the prompt prefix."""
+    return bool((sample.rollout_infos or {}).get('response_prefix_included'))
+
+
 def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_only: bool = False) -> Dict[str, Any]:
     """Encode a sample into a template.encode output dict.
 
@@ -716,6 +721,7 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
     prefixes.
     """
     data = sample.to_template_dict()
+    history_as_text = False
     if sample.response_token_ids:
         loss_mask = sample.response_loss_mask or None
         msgs = data.get('messages')
@@ -725,21 +731,40 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
         sample_et = ctk.get('enable_thinking')
         prefix_ids = get_response_prefix_ids(template, sample_enable_thinking=sample_et)
         data['messages'] = replace_assistant_response_with_ids(
-            msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids)
+            msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids,
+            prefix_included=response_prefix_included(sample))
+        # Assistant turns left as strings (history not carried as sampled ids) are
+        # context only: never train on them.
+        for message in data['messages'] or []:
+            if message.get('role') == 'assistant' and isinstance(message.get('content'), str):
+                message['loss'] = False
+                history_as_text = True
 
     if encode_prompt_only:
         messages = data.get('messages', [])
         if messages and messages[-1].get('role') == 'assistant':
             data = {**data, 'messages': messages[:-1] + [{**messages[-1], 'content': None}]}
 
-    encoded = template.encode(data, return_length=True)
-    return encoded
+    loss_scale = getattr(template, 'loss_scale', None)
+    if not history_as_text or loss_scale is None or loss_scale.base_strategy == 'last_round':
+        return template.encode(data, return_length=True)
+    # Under a non-last-round strategy the training template keeps history thinking and
+    # prefixes every assistant round with the non-thinking prefix, whereas rollout
+    # (inference mode) only touches the last round. Render string history the rollout
+    # way; token-id turns keep their explicit loss_scale either way.
+    original_strategy = loss_scale.base_strategy
+    loss_scale.base_strategy = 'last_round'
+    try:
+        return template.encode(data, return_length=True)
+    finally:
+        loss_scale.base_strategy = original_strategy
 
 
 def replace_assistant_response_with_ids(messages: 'Messages',
                                         completion_ids: List[Union[int, List[int]]],
                                         loss_mask: Optional[List[List[int]]] = None,
-                                        non_thinking_prefix_ids: Optional[List[int]] = None) -> 'Messages':  # noqa
+                                        non_thinking_prefix_ids: Optional[List[int]] = None,
+                                        prefix_included: bool = False) -> 'Messages':  # noqa
     """
     Replace assistant messages in a conversation with token IDs (and optional loss masks).
 
@@ -798,18 +823,16 @@ def replace_assistant_response_with_ids(messages: 'Messages',
     elif loss_mask:
         loss_mask = [list(mask) for mask in loss_mask]
 
-    # Inject the non-thinking prefix (e.g. '<think>\n\n</think>\n\n') into the LAST assistant turn.
-    # When enable_thinking false, the engine prepends non_thinking_prefix before generation
-    # so completion_ids here are generated with the non-thinking prefix, inject here
-    if non_thinking_prefix_ids:
+    # Inject the response prefix (e.g. '<think>\n' or '<think>\n\n</think>\n\n') into the LAST
+    # assistant turn: the generation prompt supplied it, so sampled ids never contain it.
+    # Whether ids already hold it is a property of their source (``prefix_included``), not of
+    # their first tokens: a model may itself sample the same tokens again after the prompt's.
+    if non_thinking_prefix_ids and not prefix_included:
         n_prefix = len(non_thinking_prefix_ids)
-        last_ids = list(completion_ids[-1])
-        # Skip if the response already starts with the prefix (avoid double injection).
-        if last_ids[:n_prefix] != list(non_thinking_prefix_ids):
-            if loss_mask is None:
-                loss_mask = [[1] * len(ids) for ids in completion_ids]
-            completion_ids[-1] = list(non_thinking_prefix_ids) + last_ids
-            loss_mask[-1] = [0] * n_prefix + list(loss_mask[-1])
+        if loss_mask is None:
+            loss_mask = [[1] * len(ids) for ids in completion_ids]
+        completion_ids[-1] = list(non_thinking_prefix_ids) + list(completion_ids[-1])
+        loss_mask[-1] = [0] * n_prefix + list(loss_mask[-1])
 
     if loss_mask:
         assert (
@@ -2247,9 +2270,10 @@ def collate_to_grpo_micro_batch(
     non-Ray via batch forward, Ray by stacking per-sample remote results. No
     distributed communication happens here.
     """
-    encoded_list = [s.encoded for s in samples]
-    # Snapshot encode lengths before ``data_collator``: under Megatron CP it mutates each
-    # ``encoded`` in place, rounding ``length`` up to a multiple of ``cp_size * 2``.
+    # The collator pops per-sample fields (``image_grid_thw``, ``video_grid_thw``, ...) and,
+    # under Megatron CP, rewrites ``length``. Collate shallow copies so ``s.encoded`` stays
+    # complete for the multimodal loss chunks that re-collate it.
+    encoded_list = [dict(s.encoded) for s in samples]
     expected_lens = [e.get('length') for e in encoded_list]
     model_inputs = to_device(template.data_collator(encoded_list, padding_to=padding_to), device)
 

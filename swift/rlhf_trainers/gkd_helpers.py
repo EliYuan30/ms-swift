@@ -14,7 +14,7 @@ from swift.template.base import Template
 from swift.utils import get_cu_seqlens_from_position_ids, get_logger, json_parse_to_dict
 from .gkd_loss import TeacherOutput
 from .utils import (assemble_teacher_topk_logprobs, encode_sample, get_response_prefix_ids,
-                    replace_assistant_response_with_ids)
+                    replace_assistant_response_with_ids, response_prefix_included)
 
 logger = get_logger()
 
@@ -42,7 +42,8 @@ def encode_teacher_view(
             teacher_row['messages'],
             teacher_row['response_token_ids'],
             loss_mask=loss_mask,
-            non_thinking_prefix_ids=prefix_ids)
+            non_thinking_prefix_ids=prefix_ids,
+            prefix_included=response_prefix_included(sample))
     teacher_encoded = template.encode(teacher_row, return_length=True)
     teacher_encoded.pop('_extra_kwargs', None)
     return teacher_encoded
@@ -111,7 +112,8 @@ def build_teacher_requests(samples: List[OnPolicySample], template: Optional[Tem
             messages = replace_assistant_response_with_ids([m.copy() for m in messages],
                                                            s.response_token_ids,
                                                            loss_mask,
-                                                           non_thinking_prefix_ids=prefix_ids)
+                                                           non_thinking_prefix_ids=prefix_ids,
+                                                           prefix_included=response_prefix_included(s))
         req.messages = messages
         requests.append(req)
     return requests

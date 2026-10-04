@@ -554,8 +554,12 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                     media_grid_thw = media_inputs['image_grid_thw']
                 else:
                     split_token = self._tokenize('\n')[0]
+                    # The prompt keeps only <|video_pad|> here (replace_tag), and the processor
+                    # wraps every temporal block in its own vision_start/end. Passing an outer
+                    # pair would leave an extra wrapper that vLLM (which replaces the whole
+                    # placeholder) never shows the model.
                     media_inputs = processor(
-                        text=['\n'.join(['<|vision_start|><|video_pad|><|vision_end|>'] * len(mm_data))],
+                        text=['\n'.join(['<|video_pad|>'] * len(mm_data))],
                         videos=mm_data,
                         return_tensors='pt',
                         do_resize=False,
