@@ -224,74 +224,81 @@ def assemble_teacher_completion_logprobs(
         count = completion_indices.numel()
         if count == 0:
             continue
-        if len(lps) != count and response_token_ids is not None:
-            token_turns = as_turns(response_token_ids[i])
-            if response_loss_mask is None or not response_loss_mask[i]:
-                mask_turns = [[1] * len(turn) for turn in token_turns]
-            else:
-                mask_turns = as_turns(response_loss_mask[i])
-            if len(token_turns) != len(mask_turns) or any(
-                    len(tokens) != len(mask) for tokens, mask in zip(token_turns, mask_turns)):
-                raise ValueError(
-                    f'response_token_ids and response_loss_mask are not aligned for sample {i}: '
-                    f'{[len(turn) for turn in token_turns]} vs {[len(turn) for turn in mask_turns]}')
-
-            flat_ixs = [ix[0] for ix in ixs]
-            cursor = len(flat_ixs)
-            selected_turns = []
-            # Match backwards so repeated token sequences in the user prompt cannot steal an
-            # assistant-turn match. Preserve chronological order when assembling the result.
-            for turn_index in range(len(token_turns) - 1, -1, -1):
-                tokens = token_turns[turn_index]
-                start = find_last_subsequence(flat_ixs, tokens, cursor)
-                if start is None:
-                    raise ValueError(
-                        f'Teacher returned {len(lps)} logprobs but could not locate assistant turn '
-                        f'{turn_index} ({len(tokens)} raw tokens) for the {count} sampled response tokens by id. '
-                        'The teacher server must preserve student token ids (token-in-token-out).')
-                mask = mask_turns[turn_index]
-                raw_selected = [(lps[start + j], ixs[start + j]) for j, active in enumerate(mask) if active]
-                if completion_turn_token_ids is not None:
-                    expected_ids = completion_turn_token_ids[i][turn_index]
-                    boundary_count = len(expected_ids) - len(raw_selected)
-                    if boundary_count < 0:
-                        raise ValueError(
-                            f'Raw response mask selected {len(raw_selected)} tokens but encoded student turn '
-                            f'{turn_index} has only {len(expected_ids)} active tokens for sample {i}.')
-                    boundary_start = start + len(tokens)
-                    boundary_end = boundary_start + boundary_count
-                    if boundary_end > len(lps):
-                        raise ValueError(
-                            f'Teacher sequence ended before {boundary_count} assistant boundary tokens for '
-                            f'sample {i}, turn {turn_index}.')
-                    turn_selected = raw_selected + [
-                        (lps[pos], ixs[pos]) for pos in range(boundary_start, boundary_end)
-                    ]
-                    actual_ids = [item[1][0] for item in turn_selected]
-                    if actual_ids != list(expected_ids):
-                        raise ValueError(
-                            f'Teacher/student active token ids differ for sample {i}, turn {turn_index}: '
-                            f'teacher length {len(actual_ids)}, student length {len(expected_ids)}. '
-                            'The teacher must use the same tokenizer and chat template as the student.')
+        try:
+            if len(lps) != count and response_token_ids is not None:
+                token_turns = as_turns(response_token_ids[i])
+                if response_loss_mask is None or not response_loss_mask[i]:
+                    mask_turns = [[1] * len(turn) for turn in token_turns]
                 else:
-                    turn_selected = raw_selected
-                selected_turns.append(turn_selected)
-                cursor = start
-            selected_turns.reverse()
-            selected = [item for turn in selected_turns for item in turn]
-            if len(selected) != count:
-                raise ValueError(
-                    f'Teacher response masks selected {len(selected)} tokens but completion_mask has {count} '
-                    f'active tokens for sample {i}.')
-            lps = [item[0] for item in selected]
-            ixs = [item[1] for item in selected]
-        elif len(lps) == count + 1:
-            lps, ixs = lps[:count], ixs[:count]
-        assert len(lps) == count, (f'Teacher logp count {len(lps)} != sampled tokens {count}. The teacher server '
-                                   'must use the same tokenizer as the student (token-in-token-out).')
-        # lps/ixs are per-position single-element lists ([[lp], ...]) -> [count, 1].
-        out_lp[i, completion_indices] = torch.tensor(lps, dtype=torch.float32, device=device)
-        out_ix[i, completion_indices] = torch.tensor(ixs, dtype=torch.long, device=device)
+                    mask_turns = as_turns(response_loss_mask[i])
+                if len(token_turns) != len(mask_turns) or any(
+                        len(tokens) != len(mask) for tokens, mask in zip(token_turns, mask_turns)):
+                    raise ValueError(
+                        f'response_token_ids and response_loss_mask are not aligned for sample {i}: '
+                        f'{[len(turn) for turn in token_turns]} vs {[len(turn) for turn in mask_turns]}')
+
+                flat_ixs = [ix[0] for ix in ixs]
+                cursor = len(flat_ixs)
+                selected_turns = []
+                # Match backwards so repeated token sequences in the user prompt cannot steal an
+                # assistant-turn match. Preserve chronological order when assembling the result.
+                for turn_index in range(len(token_turns) - 1, -1, -1):
+                    tokens = token_turns[turn_index]
+                    start = find_last_subsequence(flat_ixs, tokens, cursor)
+                    if start is None:
+                        raise ValueError(
+                            f'Teacher returned {len(lps)} logprobs but could not locate assistant turn '
+                            f'{turn_index} ({len(tokens)} raw tokens) for the {count} sampled response tokens by id. '
+                            'The teacher server must preserve student token ids (token-in-token-out).')
+                    mask = mask_turns[turn_index]
+                    raw_selected = [(lps[start + j], ixs[start + j]) for j, active in enumerate(mask) if active]
+                    if completion_turn_token_ids is not None:
+                        expected_ids = completion_turn_token_ids[i][turn_index]
+                        boundary_count = len(expected_ids) - len(raw_selected)
+                        if boundary_count < 0:
+                            raise ValueError(
+                                f'Raw response mask selected {len(raw_selected)} tokens but encoded student turn '
+                                f'{turn_index} has only {len(expected_ids)} active tokens for sample {i}.')
+                        boundary_start = start + len(tokens)
+                        boundary_end = boundary_start + boundary_count
+                        if boundary_end > len(lps):
+                            raise ValueError(
+                                f'Teacher sequence ended before {boundary_count} assistant boundary tokens for '
+                                f'sample {i}, turn {turn_index}.')
+                        turn_selected = raw_selected + [
+                            (lps[pos], ixs[pos]) for pos in range(boundary_start, boundary_end)
+                        ]
+                        actual_ids = [item[1][0] for item in turn_selected]
+                        if actual_ids != list(expected_ids):
+                            raise ValueError(
+                                f'Teacher/student active token ids differ for sample {i}, turn {turn_index}: '
+                                f'teacher length {len(actual_ids)}, student length {len(expected_ids)}. '
+                                'The teacher must use the same tokenizer and chat template as the student.')
+                    else:
+                        turn_selected = raw_selected
+                    selected_turns.append(turn_selected)
+                    cursor = start
+                selected_turns.reverse()
+                selected = [item for turn in selected_turns for item in turn]
+                if len(selected) != count:
+                    raise ValueError(
+                        f'Teacher response masks selected {len(selected)} tokens but completion_mask has {count} '
+                        f'active tokens for sample {i}.')
+                lps = [item[0] for item in selected]
+                ixs = [item[1] for item in selected]
+            elif len(lps) == count + 1:
+                lps, ixs = lps[:count], ixs[:count]
+            assert len(lps) == count, (f'Teacher logp count {len(lps)} != sampled tokens {count}. The teacher server '
+                                       'must use the same tokenizer as the student (token-in-token-out).')
+            # lps/ixs are per-position single-element lists ([[lp], ...]) -> [count, 1].
+            out_lp[i, completion_indices] = torch.tensor(lps, dtype=torch.float32, device=device)
+            out_ix[i, completion_indices] = torch.tensor(ixs, dtype=torch.long, device=device)
+        except (ValueError, AssertionError) as exc:
+            # One malformed trajectory must not kill the run (2026-09-21 incident:
+            # step ~976/1000 crash on an unmatchable assistant turn). Zeros mean
+            # the sample contributes no teacher signal for this step.
+            logger.warning(f'[teacher-align] skipping sample {i}: {exc}')
+            continue
     return TeacherOutput(topk_logprobs=out_lp, topk_indices=out_ix)
 
 
