@@ -1,12 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 import os
+import threading
+from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple
 
 from swift.template import ContextType, Messages, get_last_user_round
 from .utils import calculate_loss_scale
 
 ALL_BASE_STRATEGY = ['default', 'last_round', 'all']
+
+
+_STRATEGY_OVERRIDE = threading.local()
 
 
 class LossScale:
@@ -44,6 +49,34 @@ class LossScale:
         if base_strategy not in ALL_BASE_STRATEGY:
             raise ValueError(f'ALL_BASE_STRATEGY: {ALL_BASE_STRATEGY}, base_strategy: {base_strategy}')
         self.base_strategy = base_strategy
+
+    @property
+    def base_strategy(self):
+        overrides = getattr(_STRATEGY_OVERRIDE, 'by_id', None)
+        if overrides and id(self) in overrides:
+            return overrides[id(self)]
+        return self._base_strategy
+
+    @base_strategy.setter
+    def base_strategy(self, value):
+        self._base_strategy = value
+
+    @contextmanager
+    def thread_local_strategy(self, value):
+        """Override ``base_strategy`` for the calling thread only."""
+        overrides = getattr(_STRATEGY_OVERRIDE, 'by_id', None)
+        if overrides is None:
+            overrides = _STRATEGY_OVERRIDE.by_id = {}
+        key = id(self)
+        had, previous = key in overrides, overrides.get(key)
+        overrides[key] = value
+        try:
+            yield
+        finally:
+            if had:
+                overrides[key] = previous
+            else:
+                overrides.pop(key, None)
 
     def get_loss_scale(self, context: str, **kwargs) -> Tuple[List[str], List[float]]:
         """Calculate loss scale for the given context.

@@ -763,12 +763,43 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
     # prefixes every assistant round with the non-thinking prefix, whereas rollout
     # (inference mode) only touches the last round. Render string history the rollout
     # way; token-id turns keep their explicit loss_scale either way.
+    # Override for this thread only: concurrent encodes (SWIFT_ENCODE_WORKERS > 1)
+    # must not observe each other's strategy.
+    override = getattr(loss_scale, 'thread_local_strategy', None)
+    if override is not None:
+        with override('last_round'):
+            return template.encode(data, return_length=True)
     original_strategy = loss_scale.base_strategy
     loss_scale.base_strategy = 'last_round'
     try:
         return template.encode(data, return_length=True)
     finally:
         loss_scale.base_strategy = original_strategy
+
+
+def encode_samples(samples, template, encode_fn=None) -> None:
+    """Encode samples in place (``s.encoded``), optionally on worker threads.
+
+    Image/video preprocessing inside ``template.encode`` releases the GIL, so a small
+    pool overlaps it across samples. Order and results are identical to the serial loop.
+    ``encode_fn`` defaults to ``encode_sample``; callers pass their own binding so
+    module-level overrides keep working.
+    """
+    encode_fn = encode_fn or encode_sample
+
+    def _encode_one(sample):
+        encoded = encode_fn(sample, template)
+        encoded.pop('_extra_kwargs', None)  # pop add_eos
+        sample.encoded = encoded
+
+    workers = int(os.environ.get('SWIFT_ENCODE_WORKERS', '1') or 1)
+    if workers <= 1 or len(samples) <= 1:
+        for sample in samples:
+            _encode_one(sample)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers, len(samples))) as pool:
+        list(pool.map(_encode_one, samples))
 
 
 def replace_assistant_response_with_ids(messages: 'Messages',

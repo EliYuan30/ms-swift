@@ -68,7 +68,7 @@ from swift.utils import (JsonlWriter, get_cu_seqlens_from_position_ids, get_logg
                          unwrap_model_for_generation)
 from .arguments import GRPOConfig
 from .rollout_mixin import DataType, RolloutTrainerMixin, SyncRefModelCallback
-from .utils import (_ForwardRedirection, collate_to_grpo_micro_batch, compute_chord_loss, encode_sample,
+from .utils import (_ForwardRedirection, collate_to_grpo_micro_batch, compute_chord_loss, encode_sample, encode_samples,
                     get_even_process_data, identity_data_collator, load_pil_img, make_chord_sft_dataset,
                     pad_logps_back_to_batch, patch_save_last_checkpoint, profiling_context, profiling_decorator,
                     replace_assistant_response_with_ids, swanlab_get_run)
@@ -1351,10 +1351,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         for batch in gas_chunks:
             teacher_model_inputs = teacher_grpo_batch = None
             with self._template_context(template):
-                for s in batch:
-                    encoded_inputs = encode_sample(s, template)
-                    encoded_inputs.pop('_extra_kwargs', None)  # pop add_eos
-                    s.encoded = encoded_inputs
+                encode_samples(batch, template, encode_fn=encode_sample)
                 model_inputs, grpo_batch = collate_to_grpo_micro_batch(
                     batch, template, device=self.accelerator.device, use_logits_to_keep=True)
                 if trajectory_count is not None:
