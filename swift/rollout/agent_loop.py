@@ -12,6 +12,8 @@ Megatron-Ray driver process:
                     all ranks can agree on the termination condition.
 """
 import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional
 
 from swift.infer_engine import RequestConfig
@@ -146,6 +148,22 @@ def _run_multi_turn_impl(
         ]
 
         next_turn_index_to_infer: List[int] = []
+        # Tool execution (image/frame IO, decode, crop, resize, re-encode) is CPU work
+        # that releases the GIL; run the per-request steps concurrently when enabled.
+        # Results are consumed in request order below, so ordering is unchanged.
+        step_workers = int(os.environ.get('SWIFT_ROLLOUT_STEP_WORKERS', '1') or 1)
+        precomputed_steps = None
+        if step_workers > 1:
+            pending = [(index, output) for stop, index, output in zip(should_stops, index_to_infer, outputs)
+                       if not (stop or (max_turns and current_turn >= max_turns))]
+            if len(pending) > 1:
+                def _run_step(item):
+                    item_index, item_output = item
+                    return item_index, scheduler.step(requests[item_index], item_output.response.choices[0],
+                                                      current_turn)
+
+                with ThreadPoolExecutor(max_workers=min(step_workers, len(pending))) as pool:
+                    precomputed_steps = dict(pool.map(_run_step, pending))
         for stop, index, output in zip(should_stops, index_to_infer, outputs):
             if max_turns:
                 stop = stop or (current_turn >= max_turns)
@@ -206,7 +224,10 @@ def _run_multi_turn_impl(
                 continue
 
             is_continuation = is_continuations[index]
-            step_result = scheduler.step(requests[index], output.response.choices[0], current_turn)
+            if precomputed_steps is not None and index in precomputed_steps:
+                step_result = precomputed_steps[index]
+            else:
+                step_result = scheduler.step(requests[index], output.response.choices[0], current_turn)
             current_request: RolloutInferRequest = step_result['infer_request']
             return_token_id = False
             if 'response_token_ids' in step_result:
