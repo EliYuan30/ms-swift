@@ -54,8 +54,15 @@ class RLHFTrainerMixin:
                     self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.zero_stage == 3):
                 raise ValueError('offload_ref_model requires a fixed, unsharded reference (no FSDP/ZeRO-3).')
         if ref_model is not None:
+            # The reference only scores fixed sequences; caches change nothing about the
+            # logps but make eval-mode forwards build KV / linear-attention state.
+            ref_config = getattr(self.ref_model, 'config', None)
+            for config in (ref_config, getattr(ref_config, 'text_config', None)):
+                if config is not None and hasattr(config, 'use_cache'):
+                    config.use_cache = False
             if getattr(args, 'offload_ref_model', False):
                 self.ref_model = self.ref_model.requires_grad_(False).eval().to('cpu')
+                self._pin_ref_model()
             elif self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             elif self.is_fsdp_enabled:
@@ -66,15 +73,41 @@ class RLHFTrainerMixin:
 
         self.padding_value = self.tokenizer.pad_token_id
 
+    def _ref_tensors(self):
+        yield from self.ref_model.named_parameters()
+        yield from self.ref_model.named_buffers()
+
+    def _pin_ref_model(self):
+        # Keep one pinned host copy of the frozen reference. Onloading is then a fast
+        # pinned H2D copy, and offloading only re-points .data at the host copy (the
+        # weights never change, so no D2H transfer is needed).
+        if not torch.cuda.is_available():
+            return
+        self._ref_host_tensors = {}
+        for name, tensor in self._ref_tensors():
+            if name in self._ref_host_tensors:
+                continue
+            pinned = tensor.data.pin_memory()
+            tensor.data = pinned
+            self._ref_host_tensors[name] = pinned
+
     @contextmanager
     def reference_scoring_context(self):
         offloaded = getattr(self.args, 'offload_ref_model', False)
+        host = getattr(self, '_ref_host_tensors', None) if offloaded else None
         try:
-            if offloaded:
+            if host:
+                device = self.accelerator.device
+                for name, tensor in self._ref_tensors():
+                    tensor.data = host[name].to(device, non_blocking=True)
+            elif offloaded:
                 self.ref_model.to(self.accelerator.device)
             yield
         finally:
-            if offloaded:
+            if host:
+                for name, tensor in self._ref_tensors():
+                    tensor.data = host[name]
+            elif offloaded:
                 self.ref_model.to('cpu')
 
     def create_loss_and_eval_metric(self, args):

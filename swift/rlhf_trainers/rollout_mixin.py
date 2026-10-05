@@ -1149,8 +1149,13 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                                    request_config: RequestConfig,
                                    requests: Optional[List] = None,
                                    is_global_inputs: bool = False) -> List[OnPolicySample]:
+        import time as _time
+        from swift.rollout.agent_loop import _profile_event
+        _t0 = _time.time()
         if requests is None:
             requests = self.samples2requests(samples)
+        _profile_event('samples2requests', _t0)
+        _t_mt = _time.time()
         rollout_outputs = run_multi_turn(
             requests=requests,
             first_turn_outputs=first_turn_rollout_outputs,
@@ -1160,6 +1165,8 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             max_turns=self.args.max_turns,
             gather_fn=gather_object,
         )
+        _profile_event('run_multi_turn_total', _t_mt)
+        _t_fin = _time.time()
         # Colocate drives individual hooks, so it does not pass through scheduler.run().
         finalize_rollout = getattr(self.multi_turn_scheduler, 'finalize_rollout', None)
         if finalize_rollout is not None:
@@ -1172,6 +1179,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                 finalized_outputs.extend(result if isinstance(result, list) else [result])
             rollout_outputs = finalized_outputs
 
+        _profile_event('finalize_rollout', _t_fin)
         self.dynamic_num_samples = any(gather_object([len(rollout_outputs) != len(samples)]))
         if self.dynamic_num_samples:
             if self.template.padding_free:

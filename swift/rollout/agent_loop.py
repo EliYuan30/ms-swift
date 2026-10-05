@@ -47,6 +47,21 @@ def invoke_async_hook(coro):
         loop.close()
 
 
+def _profile_event(name: str, start: float) -> None:
+    """Append a timing record when SWIFT_PROFILE_JSONL is set (global rank 0 only)."""
+    path = os.environ.get('SWIFT_PROFILE_JSONL')
+    if not path or os.environ.get('RANK', '0') != '0':
+        return
+    import json
+    import time as _time
+    try:
+        with open(path, 'a') as handle:
+            handle.write(json.dumps({'t': _time.time(), 'name': f'agent_loop.{name}',
+                                     'dur': round(_time.time() - start, 4)}) + '\n')
+    except OSError:
+        pass
+
+
 def extract_logprobs_from_choice(response_choice: ChatCompletionResponseChoice) -> List[float]:
     """Extract logprobs list from response choice for rollout importance sampling."""
     if response_choice.logprobs is None:
@@ -137,7 +152,9 @@ def _run_multi_turn_impl(
                 for req, output in zip(current_requests, outputs)
             ]))
 
+        _t_hooks = __import__('time').time()
         turn_results = loop.run_until_complete(_gather_turn_ends())
+        _profile_event('on_turn_end', _t_hooks)
         for tr, index in zip(turn_results, index_to_infer):
             if tr.get('rollout_infos'):
                 rollout_infos[index].update(tr['rollout_infos'])
@@ -151,6 +168,7 @@ def _run_multi_turn_impl(
         # Tool execution (image/frame IO, decode, crop, resize, re-encode) is CPU work
         # that releases the GIL; run the per-request steps concurrently when enabled.
         # Results are consumed in request order below, so ordering is unchanged.
+        _t_steps = __import__('time').time()
         step_workers = int(os.environ.get('SWIFT_ROLLOUT_STEP_WORKERS', '1') or 1)
         precomputed_steps = None
         if step_workers > 1:
@@ -164,6 +182,7 @@ def _run_multi_turn_impl(
 
                 with ThreadPoolExecutor(max_workers=min(step_workers, len(pending))) as pool:
                     precomputed_steps = dict(pool.map(_run_step, pending))
+                _profile_event('parallel_steps', _t_steps)
         for stop, index, output in zip(should_stops, index_to_infer, outputs):
             if max_turns:
                 stop = stop or (current_turn >= max_turns)
@@ -264,9 +283,12 @@ def _run_multi_turn_impl(
             requests[index] = current_request
             next_turn_index_to_infer.append(index)
 
+        _profile_event('turn_bookkeeping_incl_steps', _t_steps)
         current_turn += 1
         infer_requests = [requests[index] for index in next_turn_index_to_infer]
+        _t_rollout = __import__('time').time()
         outputs = rollout_fn(infer_requests if has_local_data else [], request_config)
+        _profile_event('rollout_fn', _t_rollout)
         index_to_infer = next_turn_index_to_infer
 
     assert all(o is not None for o in rollout_outputs)
