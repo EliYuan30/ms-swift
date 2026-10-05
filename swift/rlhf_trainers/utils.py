@@ -585,6 +585,17 @@ def profiling_context(trainer, name: str):
     if 'swanlab' in trainer.args.report_to and swanlab_get_run() is not None and is_main_process:
         swanlab.log(profiling_metrics)
 
+    # Optional plain-file sink so phase timings survive offline/no-wandb runs.
+    profile_path = os.environ.get('SWIFT_PROFILE_JSONL')
+    if profile_path and is_main_process:
+        try:
+            import json as _json
+            with open(profile_path, 'a') as handle:
+                handle.write(_json.dumps({'t': time.time(), 'name': f'{trainer.__class__.__name__}.{name}',
+                                          'dur': round(duration, 4)}) + '\n')
+        except OSError:
+            pass
+
 
 def profiling_decorator(func):
 
