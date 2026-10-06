@@ -2511,6 +2511,13 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Wait for the eval rollout to complete
             while not self.is_async_generate_eval_rollout_done():
                 time.sleep(0.1)
+        target = os.environ.get('SWIFT_TORCH_PROFILE_AT', '')  # "global_step:micro_step"
+        if target and self.accelerator.is_main_process:
+            want_step, want_micro = (int(x) for x in target.split(':'))
+            micro = getattr(self, '_profile_micro_counter', 0)
+            self._profile_micro_counter = micro + 1
+            if self.state.global_step == want_step and micro % self.args.gradient_accumulation_steps == want_micro:
+                return self._profiled_training_step(model, inputs, num_items_in_batch)
         if not os.environ.get('SWIFT_PROFILE_JSONL'):
             return super().training_step(model, inputs, num_items_in_batch)
         # Timing probe: training_step = prepare + forward (compute_loss) + backward incl.
@@ -2519,6 +2526,41 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         with profiling_context(self, 'training_step_synced'):
             loss = super().training_step(model, inputs, num_items_in_batch)
             torch.cuda.synchronize()
+        return loss
+
+    def _profiled_training_step(self, model, inputs, num_items_in_batch):
+        from torch.profiler import ProfilerActivity, profile
+        out_dir = os.path.dirname(os.environ.get('SWIFT_PROFILE_JSONL', '') or self.args.output_dir)
+        torch.cuda.synchronize()
+        wall_start = time.time()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], with_stack=True) as prof:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            torch.cuda.synchronize()
+        wall = time.time() - wall_start
+        spans = sorted((e.time_range.start, e.time_range.end) for e in prof.events()
+                       if e.device_type == torch.autograd.DeviceType.CUDA)
+        busy, cur_s, cur_e = 0, None, None
+        for start, end in spans:
+            if cur_e is None or start > cur_e:
+                if cur_e is not None:
+                    busy += cur_e - cur_s
+                cur_s, cur_e = start, end
+            else:
+                cur_e = max(cur_e, end)
+        if cur_e is not None:
+            busy += cur_e - cur_s
+        with open(os.path.join(out_dir, 'torch_profile_step.txt'), 'w') as handle:
+            handle.write(f'wall={wall:.3f}s gpu_busy={busy / 1e6:.3f}s ({100 * busy / 1e6 / wall:.1f}%) '
+                         f'cuda_events={len(spans)}\n\n')
+            handle.write('== top by self CPU ==\n')
+            handle.write(prof.key_averages().table(sort_by='self_cpu_time_total', row_limit=40,
+                                                   max_name_column_width=80))
+            handle.write('\n== top by CUDA ==\n')
+            handle.write(prof.key_averages().table(sort_by='cuda_time_total', row_limit=25,
+                                                   max_name_column_width=80))
+            handle.write('\n== top self CPU grouped by python stack (depth 8) ==\n')
+            handle.write(prof.key_averages(group_by_stack_n=8).table(sort_by='self_cpu_time_total', row_limit=25,
+                                                                     max_name_column_width=80))
         return loss
 
     def old_policy(self):
