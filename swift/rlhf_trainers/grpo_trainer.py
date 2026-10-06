@@ -125,6 +125,32 @@ def _exclude_infra_error_groups(advantages, prompt_ids, infra_errors):
     return torch.where(excluded, torch.zeros_like(advantages), advantages), excluded
 
 
+def _offload_pixels_enabled() -> bool:
+    return os.environ.get('SWIFT_OFFLOAD_MICROBATCH_PIXELS', '0') == '1'
+
+
+def _is_pixel_key(key) -> bool:
+    return isinstance(key, str) and key.startswith('pixel_values')
+
+
+def _move_pixel_tensors(batch_encoded_inputs, device) -> None:
+    model_inputs = batch_encoded_inputs.get('model_inputs') if isinstance(batch_encoded_inputs, dict) else None
+    if not isinstance(model_inputs, dict):
+        return
+    for key, value in list(model_inputs.items()):
+        if _is_pixel_key(key) and torch.is_tensor(value):
+            model_inputs[key] = value.to(device)
+
+
+def _with_pixel_tensors_on(micro_batch, device):
+    model_inputs = micro_batch.get('model_inputs') if isinstance(micro_batch, dict) else None
+    if not isinstance(model_inputs, dict):
+        return micro_batch
+    moved = {key: (value.to(device, non_blocking=True) if _is_pixel_key(key) and torch.is_tensor(value) else value)
+             for key, value in model_inputs.items()}
+    return {**micro_batch, 'model_inputs': moved}
+
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -253,6 +279,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 micro_batches = self._generate_and_score_completions(inputs)
                 self._buffered_inputs = micro_batches
             micro_batch = self._buffered_inputs[self._step % num_rollout_samples]
+            if _offload_pixels_enabled():
+                # Copy (do not write back): the buffer stays on the host.
+                micro_batch = _with_pixel_tensors_on(micro_batch, self.accelerator.device)
         else:
             micro_batch = self._generate_and_score_completions(inputs)
         return micro_batch
@@ -1409,6 +1438,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         origin_data=origin_data,
                         teacher_model_inputs=teacher_model_inputs,
                         teacher_grpo_batch=teacher_grpo_batch)
+            if _offload_pixels_enabled():
+                # Buffered micro-batches otherwise keep every chunk's (fp32) pixel
+                # tensors resident until consumed; park them on the host instead.
+                _move_pixel_tensors(batch_encoded_inputs, 'cpu')
             ga_batch_encoded_inputs.append(batch_encoded_inputs)
 
         # --- log completion lengths ---
