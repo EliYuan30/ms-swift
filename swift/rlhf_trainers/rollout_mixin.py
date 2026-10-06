@@ -74,6 +74,34 @@ class AsyncGenerateCallback(TrainerCallback):
         self.trainer._prefetch(train_dataloader)
 
 
+class OptimizerStepProfileCallback(TrainerCallback):
+    """Times the optimizer step (ZeRO partition update + parameter all-gather)."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self._start = None
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        torch.cuda.synchronize()
+        self._start = time.perf_counter()
+
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        if self._start is None:
+            return
+        torch.cuda.synchronize()
+        duration = time.perf_counter() - self._start
+        self._start = None
+        path = os.environ.get('SWIFT_PROFILE_JSONL')
+        if path and self.trainer.accelerator.is_main_process:
+            import json
+            try:
+                with open(path, 'a') as handle:
+                    handle.write(json.dumps({'t': time.time(), 'name': 'callback.optimizer_step',
+                                             'dur': round(duration, 4)}) + '\n')
+            except OSError:
+                pass
+
+
 class SyncRefModelCallback(TrainerCallback):
 
     def __init__(self, trainer: 'RolloutTrainerMixin'):

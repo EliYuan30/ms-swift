@@ -67,7 +67,7 @@ from swift.utils import (JsonlWriter, get_cu_seqlens_from_position_ids, get_logg
                          is_wandb_available, nanstd, remove_response, seed_worker, to_device,
                          unwrap_model_for_generation)
 from .arguments import GRPOConfig
-from .rollout_mixin import DataType, RolloutTrainerMixin, SyncRefModelCallback
+from .rollout_mixin import DataType, OptimizerStepProfileCallback, RolloutTrainerMixin, SyncRefModelCallback
 from .utils import (_ForwardRedirection, collate_to_grpo_micro_batch, compute_chord_loss, encode_sample, encode_samples,
                     get_even_process_data, identity_data_collator, load_pil_img, make_chord_sft_dataset,
                     pad_logps_back_to_batch, patch_save_last_checkpoint, profiling_context, profiling_decorator,
@@ -192,6 +192,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(self))
+        if os.environ.get('SWIFT_PROFILE_JSONL'):
+            self.add_callback(OptimizerStepProfileCallback(self))
 
         if self.args.dynamic_sample or self.template.truncation_strategy == 'raise':
             self._prepare_resample_data_iterator()
@@ -2476,7 +2478,15 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Wait for the eval rollout to complete
             while not self.is_async_generate_eval_rollout_done():
                 time.sleep(0.1)
-        return super().training_step(model, inputs, num_items_in_batch)
+        if not os.environ.get('SWIFT_PROFILE_JSONL'):
+            return super().training_step(model, inputs, num_items_in_batch)
+        # Timing probe: training_step = prepare + forward (compute_loss) + backward incl.
+        # ZeRO gradient reduction. Synchronize so the wall time includes queued kernels.
+        torch.cuda.synchronize()
+        with profiling_context(self, 'training_step_synced'):
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            torch.cuda.synchronize()
+        return loss
 
     def old_policy(self):
         if self.template.sequence_parallel_size == 1:
