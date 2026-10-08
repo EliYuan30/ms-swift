@@ -54,6 +54,7 @@ from swift.rl_core.advantage import (apply_rlsd_reweight, center_rewards_within_
                                      compute_advantages_dynamic, compute_reward_metrics, compute_sdar_loss,
                                      compute_teacher_kl_per_token, compute_teacher_logratio, expand_advantage_to_per_token)
 from swift.rl_core.data import GRPOBatch, GRPOSample
+from swift.rlhf_trainers.grad_spike_guard import install_grad_spike_guard
 from swift.rl_core.grpo_algorithm import score_completions
 from swift.rlhf_trainers.gkd_helpers import (align_teacher_routes_to_completion_turns,
                                              assemble_teacher_completion_logprobs, build_opsd_samples,
@@ -151,6 +152,134 @@ def _with_pixel_tensors_on(micro_batch, device):
     return {**micro_batch, 'model_inputs': moved}
 
 
+
+def _onpolicy_old_logps_skippable(trainer, is_opsd: bool = False) -> bool:
+    """Whether the batch-preparation old-policy forward can be skipped (opt-in).
+
+    ``SWIFT_SKIP_ONPOLICY_OLD_LOGPS=1`` enables the skip only when every micro-batch of this
+    generation is consumed before the next optimizer step (``not old_policy()``), so the no-grad
+    old forward and the training forward evaluate the same weights. Nothing outside the loss may
+    need the old values: no explicit or API teacher, no OPSD batch (dynamic self-distillation is
+    only active for batches with a teacher prompt), no KL-in-reward and no Liger loss. The loss
+    then uses ``per_token_logps.detach()``, the TRL on-policy convention.
+    """
+    if os.environ.get('SWIFT_SKIP_ONPOLICY_OLD_LOGPS', '0') != '1':
+        return False
+    explicit_teacher = getattr(trainer, '_has_teacher_explicit', None)
+    explicit_teacher = explicit_teacher() if callable(explicit_teacher) else False
+    return not (trainer.old_policy() or is_opsd or explicit_teacher or getattr(trainer, 'use_teacher_api', False)
+                or getattr(trainer, 'kl_in_reward', False) or getattr(trainer, 'use_liger_loss', False))
+
+
+def _local_nograd_chunking(trainer) -> bool:
+    """Opt-in (``SWIFT_LOCAL_NOGRAD_CHUNKING=1``): decide logps chunking per rank for no-grad forwards.
+
+    Reference/old-policy scoring under ZeRO-1/2 runs no collectives, so the per-micro-batch
+    ``gather_object`` only makes every rank wait for the slowest rank's encode and forward. Grad-enabled
+    forwards, ZeRO-3 (parameter all-gathers) and sequence parallelism keep the synchronized path.
+    """
+    if os.environ.get('SWIFT_LOCAL_NOGRAD_CHUNKING', '0') != '1' or torch.is_grad_enabled():
+        return False
+    if getattr(getattr(trainer, 'template', None), 'sequence_parallel_size', 1) > 1:
+        return False
+    from transformers.integrations import is_deepspeed_zero3_enabled
+    return not is_deepspeed_zero3_enabled()
+
+
+class _EncodePrefetch:
+    """Encode micro-batch ``k+1`` on a background thread while ``k`` is collated and scored.
+
+    Opt-in with ``SWIFT_PREFETCH_ENCODE=1``. The trainer's template context (``max_length=None``) is
+    held for the whole preparation loop, so background encodes see the same template state as the
+    serial path; per-batch nested contexts then leave it unchanged. Encoding fills ``sample.encoded``
+    in place, so results and order are identical to the serial loop.
+    """
+
+    def __init__(self, trainer, chunks, template):
+        from concurrent.futures import ThreadPoolExecutor
+        self._chunks, self._template = chunks, template
+        self._context = trainer._template_context(template)
+        self._context.__enter__()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='swift-encode-prefetch')
+        self._futures = {0: self._submit(0)}
+
+    @classmethod
+    def start(cls, trainer, chunks, template):
+        if os.environ.get('SWIFT_PREFETCH_ENCODE', '0') != '1' or len(chunks) < 2:
+            return None
+        return cls(trainer, chunks, template)
+
+    def _submit(self, index):
+        return self._executor.submit(encode_samples, self._chunks[index], self._template, encode_sample)
+
+    def ready(self, index):
+        """Block until chunk ``index`` is encoded and start encoding the next one."""
+        future = self._futures.pop(index, None) or self._submit(index)
+        future.result()
+        if index + 1 < len(self._chunks) and index + 1 not in self._futures:
+            self._futures[index + 1] = self._submit(index + 1)
+
+    def close(self):
+        try:
+            for future in self._futures.values():
+                future.cancel()
+            self._executor.shutdown(wait=True)
+        finally:
+            self._context.__exit__(None, None, None)
+
+
+def _report_nonfinite_loss(trainer, loss, completion_mask, model_inputs, tensors) -> None:
+    """Log where a non-finite chunk loss comes from (one host sync per chunk).
+
+    bf16 ZeRO steps with inf/NaN gradients are skipped by DeepSpeed ``check_grad_overflow``;
+    this records the offending tensors so the source can be fixed rather than only skipped.
+    Values outside the completion mask still poison masked sums (0 * inf = NaN), so they are
+    counted separately.
+    """
+    if bool(torch.isfinite(loss.detach()).all().item()):
+        return
+    trainer._nonfinite_loss_chunks = getattr(trainer, '_nonfinite_loss_chunks', 0) + 1
+    mask = completion_mask.bool()
+    details = {}
+    for name, tensor in tensors.items():
+        if not torch.is_tensor(tensor):
+            continue
+        value = tensor.detach()
+        bad = ~torch.isfinite(value)
+        if value.shape == mask.shape:
+            inside, outside = int((bad & mask).sum().item()), int((bad & ~mask).sum().item())
+            if inside or outside:
+                details[name] = {'inside_mask': inside, 'outside_mask': outside}
+        elif bool(bad.any().item()):
+            details[name] = {'nonfinite': int(bad.sum().item()), 'shape': list(value.shape)}
+    input_ids = model_inputs.get('input_ids') if isinstance(model_inputs, dict) else None
+    accelerator = getattr(trainer, 'accelerator', None)
+    state = getattr(trainer, 'state', None)
+    logger.warning(
+        '[nonfinite-loss] rank=%s global_step=%s loss=%s chunks_so_far=%s input_shape=%s '
+        'completion_tokens_per_row=%s details=%s', getattr(accelerator, 'process_index', None),
+        getattr(state, 'global_step', None), loss.detach().float().item(), trainer._nonfinite_loss_chunks,
+        None if input_ids is None else list(input_ids.shape), mask.sum(-1).tolist(), details)
+
+
+def _log_nonfinite_guard(trainer, logs: Dict[str, float]) -> None:
+    """Expose skipped non-finite optimizer steps; DeepSpeed leaves grad_norm stale on a skip."""
+    skipped = getattr(getattr(trainer, 'model_wrapped', None), 'skipped_steps', None)
+    if isinstance(skipped, int) and not isinstance(skipped, bool):
+        logs['nonfinite/grad_skipped_steps'] = float(skipped)
+        previous = getattr(trainer, '_reported_skipped_steps', 0)
+        if skipped > previous:
+            logger.warning('[nonfinite-grad] DeepSpeed skipped %d optimizer step(s) with inf/NaN or spike-guarded '
+                           'gradients (cumulative %d, global_step %s).', skipped - previous, skipped,
+                           getattr(getattr(trainer, 'state', None), 'global_step', None))
+            trainer._reported_skipped_steps = skipped
+    logs['nonfinite/loss_chunks_rank0'] = float(getattr(trainer, '_nonfinite_loss_chunks', 0))
+    optimizer = getattr(getattr(trainer, 'model_wrapped', None), 'optimizer', None)
+    if hasattr(optimizer, 'swift_last_global_grad_norm'):
+        # Measured before the skip decision, so it is current even when DeepSpeed's grad_norm is stale.
+        logs['nonfinite/guard_grad_norm'] = float(optimizer.swift_last_global_grad_norm)
+        logs['nonfinite/grad_spike_skips'] = float(getattr(optimizer, 'swift_grad_spike_skips', 0))
+
 class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     sample_cls = GRPOSample
@@ -205,6 +334,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         self._prepare_liger_loss()
         self._prepare_metrics()
+        install_grad_spike_guard()
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -1379,70 +1509,82 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 raise ValueError('Turn-split trajectory normalization requires grpo, sapo or dr_grpo loss.')
             local_count = sum(1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in samples)
             trajectory_count = sum(gather_object([local_count]))
-        for batch in gas_chunks:
-            teacher_model_inputs = teacher_grpo_batch = None
-            with self._template_context(template):
-                encode_samples(batch, template, encode_fn=encode_sample)
-                model_inputs, grpo_batch = collate_to_grpo_micro_batch(
-                    batch, template, device=self.accelerator.device, use_logits_to_keep=True)
-                if trajectory_count is not None:
-                    # Undo turn duplication and microbatch/DDP means before gradient accumulation.
-                    grpo_batch.sequence_loss_weights = torch.tensor(
-                        [1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in batch],
-                        device=self.accelerator.device,
-                    ) * (len(batch) * len(gas_chunks) * self.accelerator.num_processes / trajectory_count)
-                # OPSD: the local teacher forwards its own (teacher_prompt + same response)
-                # encoding, so collate a separate teacher micro-batch (different length).
-                has_opsd_batch = build_opsd_samples(batch)
-                is_opsd = (has_opsd_batch and (self._has_teacher_explicit() or self._is_dynamic_self_distillation))
-                if is_opsd:
-                    teacher_model_inputs, teacher_grpo_batch = self._collate_teacher_opsd_batch(batch, template)
+        prefetch = _EncodePrefetch.start(self, gas_chunks, template)
+        try:
+            for batch_index, batch in enumerate(gas_chunks):
+                teacher_model_inputs = teacher_grpo_batch = None
+                with self._template_context(template):
+                    if prefetch is None:
+                        encode_samples(batch, template, encode_fn=encode_sample)
+                    else:
+                        prefetch.ready(batch_index)
+                    model_inputs, grpo_batch = collate_to_grpo_micro_batch(
+                        batch, template, device=self.accelerator.device, use_logits_to_keep=True)
+                    if trajectory_count is not None:
+                        # Undo turn duplication and microbatch/DDP means before gradient accumulation.
+                        grpo_batch.sequence_loss_weights = torch.tensor(
+                            [1.0 / (s.rollout_infos or {}).get('training_turn_count', 1) for s in batch],
+                            device=self.accelerator.device,
+                        ) * (len(batch) * len(gas_chunks) * self.accelerator.num_processes / trajectory_count)
+                    # OPSD: the local teacher forwards its own (teacher_prompt + same response)
+                    # encoding, so collate a separate teacher micro-batch (different length).
+                    has_opsd_batch = build_opsd_samples(batch)
+                    is_opsd = (has_opsd_batch and (self._has_teacher_explicit() or self._is_dynamic_self_distillation))
+                    if is_opsd:
+                        teacher_model_inputs, teacher_grpo_batch = self._collate_teacher_opsd_batch(batch, template)
 
-            model_inputs.pop('labels', None)
-            batch_encoded_inputs = {'model_inputs': model_inputs, 'grpo_batch': grpo_batch}
-            if self.dynamic_num_samples and self.is_multimodal:
-                batch_encoded_inputs['_origin_data'] = batch
-            if self._has_teacher and self.use_teacher_api:
-                # OPD-RL API teacher: keep the SP-gathered chunk samples so teacher routing/fetch
-                # aligns with each grpo_batch (local `samples` are shorter/reordered under SP>1).
-                batch_encoded_inputs['_chunk_samples'] = batch
-            origin_data = batch if (self.dynamic_num_samples and self.is_multimodal) else None
+                model_inputs.pop('labels', None)
+                batch_encoded_inputs = {'model_inputs': model_inputs, 'grpo_batch': grpo_batch}
+                if self.dynamic_num_samples and self.is_multimodal:
+                    batch_encoded_inputs['_origin_data'] = batch
+                if self._has_teacher and self.use_teacher_api:
+                    # OPD-RL API teacher: keep the SP-gathered chunk samples so teacher routing/fetch
+                    # aligns with each grpo_batch (local `samples` are shorter/reordered under SP>1).
+                    batch_encoded_inputs['_chunk_samples'] = batch
+                origin_data = batch if (self.dynamic_num_samples and self.is_multimodal) else None
 
-            with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
-                grpo_batch.old_per_token_logps = (
-                    self._get_per_token_logps_and_entropies(
-                        self.model, model_inputs, grpo_batch, origin_data=origin_data)[0])
-                if self.beta == 0.0:
-                    ref_per_token_logps = None
-                elif self.ref_model is not None:
-                    with disable_gradient_checkpointing(self.ref_model, self.args.gradient_checkpointing_kwargs):
-                        ref_per_token_logps = \
+                with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
+                    if _onpolicy_old_logps_skippable(self, is_opsd=is_opsd):
+                        # The loss substitutes per_token_logps.detach() from the same, not yet updated policy.
+                        grpo_batch.old_per_token_logps = None
+                    else:
+                        grpo_batch.old_per_token_logps = (
                             self._get_per_token_logps_and_entropies(
-                                self.ref_model, model_inputs, grpo_batch, origin_data=origin_data)[0]
-                else:
-                    with self.null_ref_context():
-                        ref_per_token_logps = \
-                            self._get_per_token_logps_and_entropies(
-                                self.model, model_inputs, grpo_batch, origin_data=origin_data)[0]
-                grpo_batch.ref_per_token_logps = ref_per_token_logps
-                # OPD-RL: local teacher logp on the sampled tokens (API path filled later).
-                if should_compute_local_teacher_logps(
-                        has_teacher_explicit=self._has_teacher_explicit(),
-                        is_dynamic_self_distillation=self._is_dynamic_self_distillation,
-                        use_teacher_api=self.use_teacher_api,
-                        has_opsd_batch=is_opsd,
-                ):
-                    grpo_batch.teacher_per_token_logps = self._compute_teacher_logps(
-                        model_inputs,
-                        grpo_batch,
-                        origin_data=origin_data,
-                        teacher_model_inputs=teacher_model_inputs,
-                        teacher_grpo_batch=teacher_grpo_batch)
-            if _offload_pixels_enabled():
-                # Buffered micro-batches otherwise keep every chunk's (fp32) pixel
-                # tensors resident until consumed; park them on the host instead.
-                _move_pixel_tensors(batch_encoded_inputs, 'cpu')
-            ga_batch_encoded_inputs.append(batch_encoded_inputs)
+                                self.model, model_inputs, grpo_batch, origin_data=origin_data)[0])
+                    if self.beta == 0.0:
+                        ref_per_token_logps = None
+                    elif self.ref_model is not None:
+                        with disable_gradient_checkpointing(self.ref_model, self.args.gradient_checkpointing_kwargs):
+                            ref_per_token_logps = \
+                                self._get_per_token_logps_and_entropies(
+                                    self.ref_model, model_inputs, grpo_batch, origin_data=origin_data)[0]
+                    else:
+                        with self.null_ref_context():
+                            ref_per_token_logps = \
+                                self._get_per_token_logps_and_entropies(
+                                    self.model, model_inputs, grpo_batch, origin_data=origin_data)[0]
+                    grpo_batch.ref_per_token_logps = ref_per_token_logps
+                    # OPD-RL: local teacher logp on the sampled tokens (API path filled later).
+                    if should_compute_local_teacher_logps(
+                            has_teacher_explicit=self._has_teacher_explicit(),
+                            is_dynamic_self_distillation=self._is_dynamic_self_distillation,
+                            use_teacher_api=self.use_teacher_api,
+                            has_opsd_batch=is_opsd,
+                    ):
+                        grpo_batch.teacher_per_token_logps = self._compute_teacher_logps(
+                            model_inputs,
+                            grpo_batch,
+                            origin_data=origin_data,
+                            teacher_model_inputs=teacher_model_inputs,
+                            teacher_grpo_batch=teacher_grpo_batch)
+                if _offload_pixels_enabled():
+                    # Buffered micro-batches otherwise keep every chunk's (fp32) pixel
+                    # tensors resident until consumed; park them on the host instead.
+                    _move_pixel_tensors(batch_encoded_inputs, 'cpu')
+                ga_batch_encoded_inputs.append(batch_encoded_inputs)
+        finally:
+            if prefetch is not None:
+                prefetch.close()
 
         # --- log completion lengths ---
         mode = 'train' if self.model.training else 'eval'
@@ -1889,6 +2031,20 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if mode == 'train' and self.chord_sft_iterator is not None:
             loss = compute_chord_loss(self, grpo_loss=loss)
 
+        if mode == 'train':
+            _report_nonfinite_loss(
+                self, loss, completion_mask, model_inputs, {
+                    'per_token_logps': per_token_logps,
+                    'old_per_token_logps': grpo_batch.old_per_token_logps,
+                    'ref_per_token_logps': grpo_batch.ref_per_token_logps,
+                    'rollout_per_token_logps': grpo_batch.rollout_per_token_logps,
+                    'advantages': advantages,
+                    'coef_1': coef_1,
+                    'per_token_kl': per_token_kl,
+                    'rollout_is_weights': rollout_is_weights,
+                    'per_token_loss': per_token_loss,
+                    'sequence_loss_weights': grpo_batch.sequence_loss_weights,
+                })
         return loss, metrics_data
 
     def _update_metrics(self, metrics_data):
@@ -2290,7 +2446,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             0]
         mode = 'train' if self.model.training else 'eval'
         expected_bs = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size  # noqa
-        should_chunk = self.dynamic_num_samples and any(gather_object([batch_size > expected_bs]))
+        if _local_nograd_chunking(self):
+            # No-grad scoring has no collectives, so ranks need not agree on chunking.
+            should_chunk = self.dynamic_num_samples and batch_size > expected_bs
+        else:
+            should_chunk = self.dynamic_num_samples and any(gather_object([batch_size > expected_bs]))
         if not should_chunk:
             return self._get_per_token_logps_and_entropies_single(
                 model, model_inputs, grpo_batch, compute_entropy=compute_entropy)
@@ -2371,8 +2531,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             0]
         mode = 'train' if self.model.training else 'eval'
         chunk_size = self.args.per_device_train_batch_size if mode == 'train' else self.args.per_device_eval_batch_size
-
-        batch_sizes = gather_object([batch_size])  # list[int]
+        # Equal chunk counts keep backward passes (ZeRO gradient reductions) aligned across ranks;
+        # no-grad scoring only needs its own count.
+        batch_sizes = [batch_size] if _local_nograd_chunking(self) else gather_object([batch_size])  # list[int]
         chunks_per_device = [(bs + chunk_size - 1) // chunk_size for bs in batch_sizes]
         max_chunks = max(chunks_per_device)
 
@@ -2601,6 +2762,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             metrics = {f'eval_{key}': val for key, val in metrics.items()}
 
         logs.update(metrics)
+        if mode == 'train':
+            _log_nonfinite_guard(self, logs)
 
         # Chunk/DDP entropy order differs from rollout order for split trajectories.
         # Keep scalar entropy diagnostics, but never attach misaligned row values.

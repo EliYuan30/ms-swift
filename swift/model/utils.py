@@ -40,6 +40,9 @@ class AttnImpl:
         if attn_impl is None:
             return
         logger.info(f'attn_impl: {attn_impl}')
+        if attn_impl == 'flash_attention_4':
+            from .flash_attn4_compat import patch_flash_attn_4_scalar_seqlens
+            patch_flash_attn_4_scalar_seqlens()
         use_flash_attn = AttnImpl.to_use_flash_attn(attn_impl)
         if use_flash_attn:
             attn_impl = 'flash_attention_2'
@@ -48,6 +51,18 @@ class AttnImpl:
         attn_impl_keys = attn_impl_keys or AttnImpl.attn_impl_keys
         for key in attn_impl_keys:
             HfConfigFactory.set_config_attr(config, key, attn_impl, include_vit=True, ensure_set=False)
+        if attn_impl == 'flash_attention_4':
+            from .flash_attn4_compat import vision_attn_impl_for_fa4
+            vision_impl = vision_attn_impl_for_fa4()
+            if vision_impl != attn_impl:
+                for vision_key in HfConfigFactory.vision_keys:
+                    sub_config = (config.get(vision_key)
+                                  if isinstance(config, dict) else getattr(config, vision_key, None))
+                    if sub_config is None:
+                        continue
+                    for key in attn_impl_keys:
+                        HfConfigFactory.set_config_attr(sub_config, key, vision_impl, ensure_set=False)
+                logger.info(f'flash_attention_4: vision/audio towers use {vision_impl}.')
         for key in AttnImpl.use_flash_attn_keys:
             HfConfigFactory.set_config_attr(config, key, use_flash_attn, include_vit=True, ensure_set=False)
 

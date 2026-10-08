@@ -1218,9 +1218,21 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                     'trajectory-splitting scheduler cannot be re-partitioned here. Disable '
                     'async_generate for per-turn-split multi-turn training.')
             # Match the partition used by reward/advantage gathering in the server path.
-            rollout_outputs = self._sort_by_request_id(gather_object(rollout_outputs))
-            rollout_outputs = get_even_process_data(self, rollout_outputs)
-        return self._postprocess_rollout_outputs(samples, rollout_outputs)
+            _t_rep = _time.time()
+            if os.environ.get('SWIFT_REPARTITION_ALL_TO_ALL', '0') == '1':
+                # Same assignment as sort + even split, but each output travels once.
+                from swift.rlhf_trainers.repartition import repartition_rollout_outputs
+                rollout_outputs, self.rollout_pad_count = repartition_rollout_outputs(
+                    rollout_outputs, self.accelerator.process_index, self.accelerator.num_processes,
+                    gather_fn=gather_object)
+            else:
+                rollout_outputs = self._sort_by_request_id(gather_object(rollout_outputs))
+                rollout_outputs = get_even_process_data(self, rollout_outputs)
+            _profile_event('repartition_rollout', _t_rep)
+        _t_post = _time.time()
+        result = self._postprocess_rollout_outputs(samples, rollout_outputs)
+        _profile_event('postprocess_rollout', _t_post)
+        return result
 
     def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
         # add prompt ids and system prompts

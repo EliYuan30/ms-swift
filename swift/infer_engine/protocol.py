@@ -537,6 +537,16 @@ class RolloutOutput(BaseModel):
 
     def mminfo_to_serializable(self):
         mm_keys = ['images', 'audios', 'videos']
+        # Strings (paths, URLs, data URIs) are already serializable. Re-encoding local paths reads
+        # every frame from disk on each construction: a 64-frame, three-turn trajectory split into
+        # turn states rereads 192 frames. Colocate rollouts share the trainer's filesystem, so
+        # SWIFT_ROLLOUT_KEEP_MEDIA_PATHS=1 keeps the strings and converts only in-memory media.
+        keep_strings = os.environ.get('SWIFT_ROLLOUT_KEEP_MEDIA_PATHS', '0') == '1'
+
+        def serializable(value, **kwargs):
+            if keep_strings and isinstance(value, str):
+                return value
+            return MultiModalRequestMixin.to_base64(value, **kwargs)
 
         for key, values in self.rollout_infos.items():
             if key in mm_keys:
@@ -544,12 +554,9 @@ class RolloutOutput(BaseModel):
                     values = [values]
                 for i, value in enumerate(values):
                     if key == 'videos' and isinstance(value, (list, tuple)):
-                        values[i] = [
-                            MultiModalRequestMixin.to_base64(frame, as_data_uri=True)
-                            for frame in value
-                        ]
+                        values[i] = [serializable(frame, as_data_uri=True) for frame in value]
                     else:
-                        values[i] = MultiModalRequestMixin.to_base64(value)
+                        values[i] = serializable(value)
                 self.rollout_infos[key] = values
 
 
