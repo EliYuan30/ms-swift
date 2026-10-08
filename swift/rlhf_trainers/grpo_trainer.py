@@ -55,6 +55,7 @@ from swift.rl_core.advantage import (apply_rlsd_reweight, center_rewards_within_
                                      compute_teacher_kl_per_token, compute_teacher_logratio, expand_advantage_to_per_token)
 from swift.rl_core.data import GRPOBatch, GRPOSample
 from swift.rlhf_trainers.grad_spike_guard import install_grad_spike_guard
+from swift.rlhf_trainers.grad_attribution import install_grad_attribution
 from swift.rl_core.grpo_algorithm import score_completions
 from swift.rlhf_trainers.gkd_helpers import (align_teacher_routes_to_completion_turns,
                                              assemble_teacher_completion_logprobs, build_opsd_samples,
@@ -335,6 +336,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self._prepare_liger_loss()
         self._prepare_metrics()
         install_grad_spike_guard()
+        self._grad_attribution = install_grad_attribution(self)
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -1644,6 +1646,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if getattr(self, '_grad_attribution', None) is not None:
+            # training_step receives raw rows; keep the encoded micro-batch for attribution dumps.
+            self._grad_attribution_inputs = inputs
         # Compute the per-token log probabilities for the model, return_outputs=True in mini-batch training
         if isinstance(inputs, list):
             assert len(inputs) == 1
@@ -2668,6 +2673,20 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         return output
 
     def training_step(self, model: nn.Module, inputs: DataType, num_items_in_batch=None) -> torch.Tensor:
+        loss = self._training_step_impl(model, inputs, num_items_in_batch)
+        attribution = getattr(self, '_grad_attribution', None)
+        if attribution is not None:
+            # The DeepSpeed optimizer step runs inside the boundary micro's backward, so the guard
+            # norm read here belongs to the step this micro completes.
+            optimizer = getattr(getattr(self, 'model_wrapped', None), 'optimizer', None)
+            boundary = bool(getattr(self.accelerator, 'sync_gradients', True))
+            encoded = getattr(self, '_grad_attribution_inputs', None)
+            self._grad_attribution_inputs = None
+            attribution.end_micro(encoded if encoded is not None else inputs, self.state.global_step + 1, boundary,
+                                  getattr(optimizer, 'swift_last_global_grad_norm', None))
+        return loss
+
+    def _training_step_impl(self, model: nn.Module, inputs: DataType, num_items_in_batch=None) -> torch.Tensor:
         if self.args.async_generate:
             # Wait for the eval rollout to complete
             while not self.is_async_generate_eval_rollout_done():
