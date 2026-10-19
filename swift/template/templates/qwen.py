@@ -303,6 +303,34 @@ class Qwen2AudioTemplate(Template):
 register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_audio, template_cls=Qwen2AudioTemplate))
 
 
+_PRERESIZED_MARKER = os.environ.get('SWIFT_PRERESIZED_FRAME_MARKER', '_frames_r128/')
+
+
+def _is_preresized_frame_list(video) -> bool:
+    """Frame lists written by tools/mmr7/preresize_video_frames.py (exact fetch_video outputs saved as PNG)."""
+    return (bool(_PRERESIZED_MARKER) and isinstance(video, (list, tuple)) and len(video) > 0
+            and all(isinstance(f, str) and _PRERESIZED_MARKER in f and f.endswith('.png') for f in video))
+
+
+def _load_preresized_frames(video, sample_fps, kwargs):
+    """Return what qwen_vl_utils.fetch_video(image list) returns, from frames that already hold its output.
+
+    The stored PNGs are the original pipeline's float frames rounded (and clipped) to uint8, so the model input
+    matches to within 0.5/255 per pixel while the full-resolution decode and both resizes are skipped. Odd
+    frame counts are padded with the last frame exactly as fetch_video pads before resizing.
+    """
+    frames = [np.asarray(Image.open(f).convert('RGB')) for f in video]
+    if len(frames) % 2:
+        frames.append(frames[-1])
+    # fetch_video returns float32 in [0, 255]; the stored frames are its values rounded to uint8.
+    tensor = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous().float()
+    if kwargs.get('return_video_metadata'):
+        metadata = dict(fps=sample_fps, frames_indices=list(range(len(tensor))),
+                        total_num_frames=(len(tensor) / sample_fps) * sample_fps)
+        return (tensor, metadata), sample_fps
+    return tensor, sample_fps
+
+
 class Qwen2VLTemplate(Template):
     image_token_id = 151655
     video_token_id = 151656
@@ -349,7 +377,10 @@ class Qwen2VLTemplate(Template):
             if isinstance(video, list):  # image list
                 from qwen_vl_utils import vision_process
                 video_inputs['sample_fps'] = vision_process.FPS
-            video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
+            if _is_preresized_frame_list(video):
+                video, video_kwargs = _load_preresized_frames(video, video_inputs['sample_fps'], kwargs)
+            else:
+                video, video_kwargs = fetch_video(video_inputs, return_video_sample_fps=True, **kwargs)
             tokens = ['<|vision_start|><|video_pad|><|vision_end|>']
             if self.version == 'v2_5':
                 inputs.mm_processor_kwargs.setdefault('fps', []).append(video_kwargs)

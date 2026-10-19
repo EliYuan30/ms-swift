@@ -1,5 +1,6 @@
 import atexit
 import logging
+import os
 import requests
 import threading
 import time
@@ -127,21 +128,38 @@ class VLLMInferClient:
         if isinstance(request_config, RequestConfig):
             request_config = asdict(request_config)
 
+        # Optional time budget and retries: SWIFT_INFER_HTTP_TIMEOUT is the total budget in seconds,
+        # split evenly over 1 + SWIFT_INFER_HTTP_RETRIES attempts, so the whole retry sequence ends
+        # before the trainer's NCCL watchdog (ddp_timeout) fires. Unset keeps the old behaviour:
+        # wait forever. Without a timeout one stalled teacher request leaves rank 0 blocked while
+        # every other rank sits in the next collective until the watchdog kills the job.
+        timeout_env = os.environ.get('SWIFT_INFER_HTTP_TIMEOUT')
+        http_retries = int(os.environ.get('SWIFT_INFER_HTTP_RETRIES', '0')) if timeout_env else 0
+        http_timeout = float(timeout_env) / (http_retries + 1) if timeout_env else None
+
         def process_chunk(i, chunk):
             try:
                 if len(chunk) > 0 and isinstance(chunk[0], RolloutInferRequest):
                     chunk = [asdict(req) for req in chunk]
 
-                response = self.sessions[i].post(
-                    f'{self.base_urls[i]}/infer/',
-                    json={
-                        'infer_requests': chunk,
-                        'request_config': request_config,
-                        'metrics': metrics,
-                        'use_tqdm': use_tqdm,
-                        'adapter_request': adapter_request,
-                    },
-                )
+                payload = {
+                    'infer_requests': chunk,
+                    'request_config': request_config,
+                    'metrics': metrics,
+                    'use_tqdm': use_tqdm,
+                    'adapter_request': adapter_request,
+                }
+                for attempt in range(http_retries + 1):
+                    try:
+                        response = self.sessions[i].post(
+                            f'{self.base_urls[i]}/infer/', json=payload, timeout=http_timeout)
+                        break
+                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                        if attempt >= http_retries:
+                            raise
+                        logger.warning(f'infer request to {self.base_urls[i]} failed ({exc!r}); '
+                                       f'retry {attempt + 1}/{http_retries}')
+                        self.sessions[i] = requests.Session()
 
                 if response.status_code != 200:
                     errors[i] = Exception(f'Server {i} failed: {response.status_code}, {response.text}')

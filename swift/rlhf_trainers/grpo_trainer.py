@@ -690,7 +690,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
             return None
 
-        from tool_rewards import CROP_TOOL, SELECT_TOOL, bbox_area_ratio, parse_crop_boxes, parse_tool_metadata, tool_iou_metrics
+        from tool_rewards import (CROP_TOOL, SELECT_TOOL, bbox_area_ratio, gate_iou_threshold, parse_crop_boxes,
+                                  parse_tool_metadata, tool_iou_metrics)
 
         local_info = []
         for sample in samples:
@@ -730,6 +731,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'modality': sample.get_tag('teacher_route') or ('video' if preferred_tool == SELECT_TOOL else 'image'),
                 'gate_candidate_ious': [call['gate_candidate_iou'] for call in calls
                                        if call.get('gate_eligible') and call.get('gate_candidate_iou') is not None],
+                # A scored candidate always uses the canonical tool, so its name selects the threshold.
+                'gate_candidate_thresholds': [
+                    gate_iou_threshold(call.get('name')) for call in calls
+                    if call.get('gate_eligible') and call.get('gate_candidate_iou') is not None],
                 'crop_areas': crop_areas,
                 'crop_count': len(crop_calls),
                 'crop_removed_count': sum(bool(call.get('crop_on_removed_original')) for call in crop_calls),
@@ -867,11 +872,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             if count:
                 self._metrics[mode][f'gate/replacement_rate/{modality}'].append(
                     sum(info['gate_replaced_count'] for info in subset) / count)
-            ious = [value for info in subset for value in info['gate_candidate_ious']]
-            if ious:
-                from tool_rewards import MIN_BRANCH_IOU
+            pairs = [pair for info in subset
+                     for pair in zip(info['gate_candidate_ious'], info['gate_candidate_thresholds'])]
+            if pairs:
                 self._metrics[mode][f'gate/threshold_band_rate/{modality}'].append(
-                    sum(abs(value - MIN_BRANCH_IOU) <= 0.1 + 1e-9 for value in ious) / len(ious))
+                    sum(abs(value - threshold) <= 0.1 + 1e-9 for value, threshold in pairs) / len(pairs))
 
         for reason in ('unexecuted_tool_call', 'boxed_count', 'unbalanced_boxed',
                        'trailing_text', 'unbalanced_tool_response', 'repeated_text', 'length'):
