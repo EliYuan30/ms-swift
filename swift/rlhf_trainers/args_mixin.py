@@ -367,7 +367,7 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
         offload_ref_model (bool): Keep the frozen reference on CPU outside rollout scoring. Supports unsharded
             reference models with full-model GRPO and ZeRO stages 0-2. Defaults to False.
         mask_positive_invalid_final_advantages (bool): Cap positive advantages of invalid terminal states at zero
-            for the utility_visual_tool_drop scheduler, without changing earlier tool states. Defaults to False.
+            for the gd_grpo scheduler, without changing earlier tool states. Defaults to False.
     """
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
@@ -444,7 +444,7 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # OPD-RL (On-Policy Distillation as RL)
     # enabled when a teacher (teacher_model / teacher_model_server) is set on a GRPO run.
     teacher_kl_coef: float = 1.0
-    # Utility-gated branch-aware MOPD. Canonical branch tokens are excluded from
+    # Reframe-gated branch-aware MOPD. Canonical branch tokens are excluded from
     # sampled-token policy gradients and optimized by an explicit token NLL.
     mopd_advantage_clip: Optional[float] = None
     mopd_branch_loss_coef: float = 0.0

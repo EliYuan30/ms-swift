@@ -1693,12 +1693,12 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                 requests_list.append(data)
             else:
                 requests_list.append(data.to_infer_request(include_extra=include_extra))
-        utility_scheduler = getattr(self.args, "multi_turn_scheduler", None) in {
-            "utility_visual_tool", "utility_visual_tool_drop"
+        reframe_scheduler = getattr(self.args, "multi_turn_scheduler", None) in {
+            "og_mopd", "gd_grpo"
         }
-        if utility_scheduler or os.environ.get("UTILITY_ORIGINAL_VISION_DROP", "0") == "1":
+        if reframe_scheduler or os.environ.get("GD_GRPO_ORIGINAL_OBSERVATION_DROP", "0") == "1":
             for request in requests_list:
-                request.data_dict["utility_training"] = bool(self.model.training)
+                request.data_dict["reframe_training"] = bool(self.model.training)
         return requests_list
 
     def async_generate_rollout(self, all_inputs: List[OnPolicySample]):
