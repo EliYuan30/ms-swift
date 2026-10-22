@@ -33,7 +33,6 @@ class VllmArguments:
             Defaults to None.
         vllm_data_parallel_size (int): Data parallelism size for vLLM rollout. Default is 1.
     """
-    # vllm
     vllm_gpu_memory_utilization: float = 0.9
     vllm_tensor_parallel_size: int = 1
     vllm_pipeline_parallel_size: int = 1
@@ -52,7 +51,6 @@ class VllmArguments:
     vllm_mm_processor_cache_gb: Optional[float] = None
     vllm_speculative_config: Optional[Union[dict, str]] = None
     vllm_engine_kwargs: Optional[Union[dict, str]] = None
-    # rollout
     vllm_data_parallel_size: int = 1
 
     def __post_init__(self):
@@ -158,22 +156,18 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
             set of generated samples. Only one of `steps_per_generation` and `generation_batch_size` should be set.
             Defaults to `gradient_accumulation_steps`.
     """
-    # generation args
     top_k: int = -1
     top_p: float = 1.0
     min_p: float = 0.0
     repetition_penalty: float = 1.
     stop_words: List[str] = field(default_factory=list)
 
-    # vllm
     use_vllm: bool = False
     vllm_mode: Optional[Literal['server', 'colocate']] = None
-    # internal vllm (colocate)
     vllm_max_num_seqs: Optional[int] = None
     vllm_enable_prefix_caching: bool = True  # overwrite
     vllm_enable_lora: bool = False
-    lora_rank: int = 8  # for vllm lora adapter
-    # external vllm (server)
+    lora_rank: int = 8
     vllm_server_base_url: Optional[List[str]] = None
     vllm_server_host: Optional[List[str]] = None
     vllm_server_port: List[int] = field(default_factory=lambda: [8000])
@@ -182,7 +176,6 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     vllm_server_group_port: Optional[List[int]] = None
     enable_flattened_weight_sync: bool = True
     async_generate: bool = False
-    # # structured outputs (guided decoding), only effective for vllm backend
     structured_outputs_regex: Optional[str] = None
 
     sleep_level: int = 0
@@ -387,7 +380,6 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     reward_model: Optional[List[str]] = None
     reward_model_plugin: Optional[List[str]] = None
 
-    # chord
     chord_sft_dataset: List[str] = field(default_factory=list)
     chord_sft_per_device_train_batch_size: Optional[int] = None
 
@@ -397,14 +389,12 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     chord_mu_peak: Optional[float] = None
     chord_mu_valley: Optional[float] = None
 
-    # sync ref model
     sync_ref_model: bool = False
     ref_model_sync_steps: int = 512
     ref_model_mixup_alpha: float = 0.6
     offload_ref_model: bool = False
     mask_positive_invalid_final_advantages: bool = False
 
-    # multi turn
     multi_turn_scheduler: Optional[str] = None
     max_turns: Optional[int] = None
     completion_length_limit_scope: Literal['total', 'per_round'] = 'per_round'
@@ -423,7 +413,6 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # GDPO: normalize each reward function separately, https://arxiv.org/abs/2601.05242
     scale_rewards: Optional[Literal['group', 'batch', 'none', 'gdpo']] = None
 
-    # entropy
     log_entropy: bool = False
     # Beyond the 80/20 Rule, https://arxiv.org/abs/2506.01939
     top_entropy_quantile: float = 1.0
@@ -432,7 +421,6 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     importance_sampling_level: Literal['token', 'sequence', 'sequence_token'] = 'token'
 
     # SAPO https://arxiv.org/abs/2511.20347
-    # Temperature parameters for soft adaptive gate
     tau_pos: float = 1.0
     tau_neg: float = 1.05
 
@@ -444,15 +432,12 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     # OPD-RL (On-Policy Distillation as RL)
     # enabled when a teacher (teacher_model / teacher_model_server) is set on a GRPO run.
     teacher_kl_coef: float = 1.0
-    # Reframe-gated branch-aware MOPD. Canonical branch tokens are excluded from
-    # sampled-token policy gradients and optimized by an explicit token NLL.
+    # Exclude injected branch tokens from policy gradients and train them with NLL.
     mopd_advantage_clip: Optional[float] = None
     mopd_branch_loss_coef: float = 0.0
 
     # RLSD (Self-Distilled RLVR), https://arxiv.org/abs/2604.03128
-    # Token-level advantage reweighting using the teacher-vs-student logprob gap. Reuses the OPSD
-    # self-distillation teacher forward (teacher = current policy conditioned on the ground-truth
-    # answer via a per-sample ``teacher_prompt`` column). Set ``advantage_reweight='rlsd'`` to enable.
+    # RLSD reweights advantages using the privileged-prompt teacher logprob gap.
     advantage_reweight: Optional[Literal['rlsd']] = None
     rlsd_lambda: float = 0.5  # mixing weight: 0 -> pure GRPO, 1 -> full RLSD reweighting
     rlsd_reweight_clip_range: float = 0.2  # eps_w: clip evidence weight to [1-eps_w, 1+eps_w]
@@ -461,11 +446,7 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     rlsd_negative_only: bool = False  # only reweight sequences with advantage < 0
 
     # SDAR (Self-Distilled Agentic RL), https://arxiv.org/abs/2605.15155
-    # Confidence-gated teacher distillation auxiliary loss added to the GRPO policy loss:
-    #   L_SDAR = token-mean( sigmoid(sdar_gate_beta*(logP_T-logP_S)) * (logP_T-logP_S) ),
-    #   loss   = policy_loss + sdar_loss_coef * L_SDAR.
-    # Reuses the OPSD self-distillation teacher (teacher = current policy conditioned on a privileged
-    # per-sample ``teacher_prompt`` column). Enabled when ``sdar_loss_coef > 0``.
+    # SDAR adds a confidence-gated teacher loss using the privileged teacher_prompt.
     sdar_loss_coef: float = 0.0  # 0 disables SDAR; reference uses 0.1 (0.01 for ALFWorld)
     sdar_gate_beta: float = 5.0  # sigmoid gate temperature (higher -> sharper gating)
 
@@ -480,7 +461,6 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
 
     num_generations_eval: Optional[int] = None
 
-    # dataset
     dataset_shuffle: Optional[bool] = True
 
     # Rollout Importance Sampling Correction (off-policy correction)
@@ -489,15 +469,12 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
                                                        'sequence_mask']] = None
     rollout_importance_sampling_threshold: float = 2.0  # Threshold for truncation/masking (C in paper)
     log_rollout_offpolicy_metrics: bool = False  # Log off-policy metrics even when IS correction is disabled
-    # Off-Policy Sequence Masking: mask out sequences that deviate too much from rollout policy
-    # If set, compute mean(rollout_per_token_logps - per_token_logps) per sequence,
-    # and mask sequences where this delta > threshold AND advantage < 0
-    # Falls back to old_per_token_logps if rollout_per_token_logps is not available
+    # Mask negative-advantage sequences whose mean logprob gap exceeds the threshold;
+    # fall back to old policy logprobs when rollout logprobs are unavailable.
     off_policy_sequence_mask_delta: Optional[float] = None
 
     def __post_init__(self):
         super().__post_init__()
-        # gym_env implies use_gym_env unless the user said otherwise; mirrors deploy_args behavior so the
-        # default propagates to GRPOConfig too (not just RLHFArguments).
+        # Propagate an implicit gym_env setting to GRPOConfig as well as RLHFArguments.
         if self.use_gym_env is None and self.gym_env is not None:
             self.use_gym_env = True

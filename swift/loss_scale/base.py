@@ -183,7 +183,7 @@ class ConfigLossScale(LossScale):
             containing predefined loss scale values for specific patterns or tokens.
     """
     is_binary = None
-    loss_scale_config = None  # path
+    loss_scale_config = None
 
     def __init__(self, base_strategy: Literal['default', 'last_round', 'all'] = 'default'):
         """Initialize the config-based loss scale object.

@@ -22,10 +22,7 @@ from swift.utils import remove_response
 from .multi_turn import MultiTurnScheduler
 
 RolloutFn = Callable[[List[RolloutInferRequest], RequestConfig], List[RolloutOutput]]
-# gather_fn is expected to follow accelerate's `gather_object` convention:
-# each rank passes a list (its contribution), and the return value is the
-# concatenated flat list across all ranks. Passing a scalar would crash
-# accelerate's implementation (it iterates each rank's contribution).
+# accelerate.gather_object expects a list per rank and returns the concatenated list.
 GatherFn = Callable[[List[bool]], List[bool]]
 
 
@@ -165,9 +162,7 @@ def _run_multi_turn_impl(
         ]
 
         next_turn_index_to_infer: List[int] = []
-        # Tool execution (image/frame IO, decode, crop, resize, re-encode) is CPU work
-        # that releases the GIL; run the per-request steps concurrently when enabled.
-        # Results are consumed in request order below, so ordering is unchanged.
+        # Parallel CPU tool execution preserves request order when collecting results.
         _t_steps = __import__('time').time()
         step_workers = int(os.environ.get('SWIFT_ROLLOUT_STEP_WORKERS', '1') or 1)
         precomputed_steps = None
@@ -211,10 +206,7 @@ def _run_multi_turn_impl(
                     if current_logprobs:
                         rollout_logprobs[index].append(current_logprobs)
 
-                # Validate rollout_logprobs completeness: if logprobs are incomplete (missing for some turns),
-                # clear them to disable rollout importance sampling correction (which requires complete logprobs).
-                # rollout_logprobs should match the number of loss_mask=1 tokens, not total response tokens,
-                # because completion_mask in grpo_trainer is based on labels != -100, which corresponds to loss_mask=1
+                # Correction requires complete per-turn logprobs aligned with loss_mask=1 tokens.
                 final_rollout_logprobs = rollout_logprobs[index]
                 if rollout_logprobs[index]:
                     total_logprob_count = sum(len(turn_lps) for turn_lps in rollout_logprobs[index])
@@ -265,11 +257,9 @@ def _run_multi_turn_impl(
                     response_loss_mask[index].append(step_result['response_loss_mask'])
 
             if 'rollout_infos' in step_result:
-                # Always overwrite the rollout info for this step.
-                # If you need to keep all step-wise details, switch to append or merge instead.
                 rollout_infos[index].update(step_result['rollout_infos'])
 
-            # Prefer step's returned logprobs (which may be modified/truncated) over raw response_choice logprobs.
+            # Use scheduler logprobs, which may have been truncated.
             if 'rollout_logprobs' in step_result and step_result['rollout_logprobs']:
                 current_logprobs = step_result['rollout_logprobs']
             else:

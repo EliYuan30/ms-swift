@@ -19,8 +19,7 @@ from swift.utils import get_logger
 logger = get_logger()
 
 _SCALAR_ARGUMENTS = ('max_seqlen_q', 'max_seqlen_k', 'min_seqlen_k')
-# Defensive: the Qwen3.5 vision tower passes value views sliced out of the fused qkv projection.
-# b19 handled such row strides correctly on GPU, and a dense copy is cheap next to attention.
+# Make Qwen3.5 vision QKV slices contiguous for FA4.
 _TENSOR_ARGUMENTS = ('q', 'k', 'v', 'qv', 'cu_seqlens_q', 'cu_seqlens_k')
 _PATCHED_ATTR = '_swift_scalar_seqlen_patch'
 

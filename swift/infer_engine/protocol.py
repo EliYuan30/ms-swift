@@ -165,7 +165,7 @@ def random_uuid() -> str:
 
 @dataclass
 class Model:
-    id: str  # model_type
+    id: str
 
     object: str = 'model'
     created: int = field(default_factory=lambda: int(time.time()))
@@ -513,7 +513,6 @@ class RolloutOutput(BaseModel):
             (Optional) Additional rollout information. This must be JSON-serializable.
     """
     response: ChatCompletionResponse
-    # multi turn
     messages: Optional[Messages] = None
     response_token_ids: List[List[int]] = Field(default_factory=list)
     response_loss_mask: List[List[int]] = Field(default_factory=list)
@@ -531,16 +530,13 @@ class RolloutOutput(BaseModel):
         return v
 
     def model_post_init(self, __context):
-        # Ensure multimodal data in rollout_infos is serializable (e.g., images to base64)
         super().model_post_init(__context)
         self.mminfo_to_serializable()
 
     def mminfo_to_serializable(self):
         mm_keys = ['images', 'audios', 'videos']
-        # Strings (paths, URLs, data URIs) are already serializable. Re-encoding local paths reads
-        # every frame from disk on each construction: a 64-frame, three-turn trajectory split into
-        # turn states rereads 192 frames. Colocate rollouts share the trainer's filesystem, so
-        # SWIFT_ROLLOUT_KEEP_MEDIA_PATHS=1 keeps the strings and converts only in-memory media.
+        # Keep serialized media paths when colocate workers share the filesystem;
+        # otherwise turn splitting repeatedly rereads and encodes the same frames.
         keep_strings = os.environ.get('SWIFT_ROLLOUT_KEEP_MEDIA_PATHS', '0') == '1'
 
         def serializable(value, **kwargs):

@@ -57,7 +57,6 @@ class VLLMInferClient:
             self.hosts = []
             for url in base_urls:
                 parsed_url = urlparse(url)
-                # Use resolve_hostname instead of gethostbyname for IPv6 support
                 host = resolve_hostname(parsed_url.hostname)
                 scheme = parsed_url.scheme or 'http'
                 base_url_i = f'{scheme}://{parsed_url.netloc}{parsed_url.path}'
@@ -66,7 +65,6 @@ class VLLMInferClient:
         else:
             if len(hosts) != len(server_ports):
                 raise ValueError('host and server_port must have same length when lists are provided')
-            # Format IPv6 addresses correctly in URLs (wrap with brackets)
             self.base_urls = [f'http://{format_host_for_url(h)}:{p}' for h, p in zip(hosts, server_ports)]
             self.hosts = hosts
 
@@ -128,11 +126,8 @@ class VLLMInferClient:
         if isinstance(request_config, RequestConfig):
             request_config = asdict(request_config)
 
-        # Optional time budget and retries: SWIFT_INFER_HTTP_TIMEOUT is the total budget in seconds,
-        # split evenly over 1 + SWIFT_INFER_HTTP_RETRIES attempts, so the whole retry sequence ends
-        # before the trainer's NCCL watchdog (ddp_timeout) fires. Unset keeps the old behaviour:
-        # wait forever. Without a timeout one stalled teacher request leaves rank 0 blocked while
-        # every other rank sits in the next collective until the watchdog kills the job.
+        # Split the optional HTTP timeout across retry attempts so requests finish before
+        # the NCCL watchdog. An unset timeout waits indefinitely.
         timeout_env = os.environ.get('SWIFT_INFER_HTTP_TIMEOUT')
         http_retries = int(os.environ.get('SWIFT_INFER_HTTP_RETRIES', '0')) if timeout_env else 0
         http_timeout = float(timeout_env) / (http_retries + 1) if timeout_env else None
@@ -222,7 +217,6 @@ class VLLMClient(VLLMInferClient):
 
             world_size = vllm_world_size + 1
             rank = vllm_world_size
-            # Use '::' for IPv6 hosts, '0.0.0.0' for IPv4 hosts
             bind_host = '::' if is_valid_ipv6_address(self.hosts[i]) else '0.0.0.0'
             response = self.sessions[i].post(
                 f'{self.base_urls[i]}/init_communicator/',
@@ -339,7 +333,6 @@ class VLLMClient(VLLMInferClient):
         errors = [None] * self.num_servers
         peft_config = peft_config_to_dict(peft_config)
 
-        # Build metadata for each tensor
         lora_tensors_metadata = []
         for name, param in lora_params.items():
             metadata = {
@@ -368,7 +361,6 @@ class VLLMClient(VLLMInferClient):
                 if response.status_code != 200:
                     raise Exception(f'Server {i} update adapter failed: {response.text}')
 
-                # Broadcast each tensor individually
                 synchronize()
                 for name, param in lora_params.items():
                     broadcast_tensor_for_vllm_weight_sync(self.pynccl_comms[i], param, src=self.pynccl_comms[i].rank)

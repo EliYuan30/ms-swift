@@ -39,7 +39,6 @@ class RLHFTrainerMixin:
         if self.is_encoder_decoder:
             self.decoder_start_token_id = HfConfigFactory.get_config_attr(model.config, 'decoder_start_token_id')
             self.pad_token_id = HfConfigFactory.get_config_attr(model.config, 'pad_token_id')
-        # not use
         self.is_vision_model = False
         self.label_pad_token_id = -100
         self.use_dpo_data_collator = True
@@ -54,8 +53,7 @@ class RLHFTrainerMixin:
                     self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.zero_stage == 3):
                 raise ValueError('offload_ref_model requires a fixed, unsharded reference (no FSDP/ZeRO-3).')
         if ref_model is not None:
-            # The reference only scores fixed sequences; caches change nothing about the
-            # logps but make eval-mode forwards build KV / linear-attention state.
+            # Disable unused generation caches during fixed-sequence reference scoring.
             ref_config = getattr(self.ref_model, 'config', None)
             for config in (ref_config, getattr(ref_config, 'text_config', None)):
                 if config is not None and hasattr(config, 'use_cache'):
@@ -78,9 +76,7 @@ class RLHFTrainerMixin:
         yield from self.ref_model.named_buffers()
 
     def _pin_ref_model(self):
-        # Keep one pinned host copy of the frozen reference. Onloading is then a fast
-        # pinned H2D copy, and offloading only re-points .data at the host copy (the
-        # weights never change, so no D2H transfer is needed).
+        # Frozen reference weights share one pinned host copy; offloading requires no D2H transfer.
         if not torch.cuda.is_available():
             return
         self._ref_host_tensors = {}
@@ -145,14 +141,14 @@ class RLHFTrainerMixin:
             model_kwargs['output_router_logits'] = True
         outputs = model(**model_kwargs, use_cache=False)
         model_kwargs['labels'] = labels
-        model_kwargs['chosen_labels'] = torch.zeros(model_kwargs['labels'].shape[0] // 2)  # just get shape
+        model_kwargs['chosen_labels'] = torch.zeros(model_kwargs['labels'].shape[0] // 2)
         if outputs.logits.shape[1] != labels.shape[1]:
             # for llava, the model returns logits for the entire sequence, including the image tokens
             # (placed before the text tokens)
             outputs.logits = outputs.logits[:, -labels.shape[1]:]
         for key in ['input_ids', 'attention_mask', 'labels']:
             model_kwargs[f'concatenated_{key}'] = model_kwargs.pop(key, None)
-        if self.__class__.__name__ == 'ORPOTrainer':  # Pass-through labels
+        if self.__class__.__name__ == 'ORPOTrainer':
             model_kwargs['concatenated_input_ids'] = model_kwargs['concatenated_labels']
 
         @contextmanager

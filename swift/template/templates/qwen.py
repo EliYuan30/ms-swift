@@ -374,7 +374,7 @@ class Qwen2VLTemplate(Template):
                 kwargs['return_video_metadata'] = True
             video = inputs.videos[index]
             video_inputs = {'video': video, **inputs.chat_template_kwargs}
-            if isinstance(video, list):  # image list
+            if isinstance(video, list):
                 from qwen_vl_utils import vision_process
                 video_inputs['sample_fps'] = vision_process.FPS
             if _is_preresized_frame_list(video):
@@ -585,10 +585,7 @@ class Qwen3VLTemplate(Qwen2VLTemplate):
                     media_grid_thw = media_inputs['image_grid_thw']
                 else:
                     split_token = self._tokenize('\n')[0]
-                    # The prompt keeps only <|video_pad|> here (replace_tag), and the processor
-                    # wraps every temporal block in its own vision_start/end. Passing an outer
-                    # pair would leave an extra wrapper that vLLM (which replaces the whole
-                    # placeholder) never shows the model.
+                    # The processor wraps each temporal block; an outer vision wrapper would differ from vLLM.
                     media_inputs = processor(
                         text=['\n'.join(['<|video_pad|>'] * len(mm_data))],
                         videos=mm_data,
@@ -641,11 +638,8 @@ class Qwen3_5Template(Qwen3VLTemplate):
         return Qwen2VLTemplate._post_encode(self, model, inputs)
 
     def _swift_prepare_inputs(self, inputs: StdTemplateInputs):
-        # Normalize message content so the swift backend byte-matches Qwen3.5/Qwen3.6
-        # HF `chat_template.jinja` rendering (per-role `|trim` and canonical <think> padding).
-        # Must run BEFORE super(), because super() merges/wraps tool messages into
-        # `<tool_response>...</tool_response>` blobs using the raw inner content.
-        # See: https://github.com/modelscope/ms-swift/issues/9276
+        # Match HF chat_template.jinja trimming before super() wraps tool content.
+        # https://github.com/modelscope/ms-swift/issues/9276
         if isinstance(inputs.system, str):
             inputs.system = inputs.system.strip()
         for message in inputs.messages:
@@ -654,10 +648,8 @@ class Qwen3_5Template(Qwen3VLTemplate):
             if not isinstance(content, str):
                 continue
             if role in ('user', 'system', 'tool'):
-                # HF applies `|trim` to user/system/tool content.
                 message['content'] = content.strip()
             elif role == 'assistant':
-                # HF applies `|trim` and re-wraps the <think>...</think> block with canonical newlines.
                 stripped = content.strip()
                 if '</think>' in stripped and '<think>' in stripped:
                     before, _, after = stripped.partition('</think>')
@@ -754,9 +746,8 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         elif self.version == 'omni_v3':
             from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import Qwen3OmniMoeProcessorKwargs
             default = Qwen3OmniMoeProcessorKwargs._defaults
-            # Fix: WhisperFeatureExtractor defaults to truncation=True, which silently
-            # truncates audio longer than 30s. Qwen3 Omni supports variable-length audio,
-            # so we must disable truncation. See: huggingface/transformers#41473
+            # Disable Whisper's default 30-second truncation for variable-length Qwen3 Omni audio.
+            # See huggingface/transformers#41473.
             default.setdefault('audio_kwargs', {})
             default['audio_kwargs']['truncation'] = False
         self.seconds_per_chunk = default['videos_kwargs']['seconds_per_chunk']
@@ -814,7 +805,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         elif media_type == 'video':
             video = inputs.videos[index]
             video_inputs = {'video': video, **inputs.chat_template_kwargs}
-            if isinstance(video, list):  # image list
+            if isinstance(video, list):
                 from qwen_omni_utils import vision_process
                 video_inputs['sample_fps'] = vision_process.FPS
             _video = fetch_video(video_inputs, **kwargs)
@@ -822,7 +813,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 _video = _video.to(torch.uint8)
             inputs.videos[index] = _video
             if self.use_audio_in_video:
-                if isinstance(video, list):  # image list
+                if isinstance(video, list):
                     raise ValueError('image list as video input does not support use_audio_in_video')
                 audio = load_audio(video, sampling_rate)
                 if self.mode != 'vllm':
@@ -919,7 +910,6 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         labels = encoded['labels']
         loss_scale = encoded.get('loss_scale', None)
         config = self.config.thinker_config
-        # audio
         if self.version == 'omni_v3':
             audio_token_id = [config.audio_token_id]
         else:
@@ -1173,9 +1163,7 @@ register_template(
     QwenTemplateMeta(
         MLLMTemplateType.qwen3_asr,
         template_cls=Qwen3ASRTemplate,
-        # Even without adding a system message,
-        # the '<|im_start|>system\n<|im_end|>\n' prefix is still present.
-        # Align with the qwen3_asr template.
+        # Keep the empty system prefix to match the qwen3_asr template.
         system_prefix=None,
         default_system=None,
         prefix=['<|im_start|>system\n{{SYSTEM}}<|im_end|>\n']))
@@ -1191,7 +1179,6 @@ class Qwen3TTSTemplate(Template):
         super().init_env_args()
         self._config_initialized = False
         self.target_speaker_embedding = None
-        # Cache TTS config values for data collation
         config = self.config
         self._tts_pad_token_id = config.tts_pad_token_id
         self._tts_bos_token_id = config.tts_bos_token_id
@@ -1230,14 +1217,11 @@ class Qwen3TTSTemplate(Template):
         pass
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
-        # Get text from messages (assistant content)
         text = inputs.messages[-1]['content'] if inputs.messages else ''
 
-        # Build TTS text with assistant markers
         tts_text = f'<|im_start|>assistant\n{text}'
         text_ids = self._tokenize(tts_text)
 
-        # Get audio codes (pre-extracted or online)
         audio_codes = inputs.extra_kwargs.get('audio_codes')
         if audio_codes is None:
             audio_path = inputs.audios[0] if inputs.audios else None
@@ -1248,7 +1232,6 @@ class Qwen3TTSTemplate(Template):
         assert audio_codes is not None, "Either 'audio_codes' or 'audio'/'audios' must be provided in the dataset."
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)  # [t, 16]
 
-        # Extract mel spectrogram from reference audio
         ref_audios = inputs.extra_kwargs.get('ref_audios')
         ref_audio_path = ref_audios[0]
         assert ref_audio_path is not None, "'ref_audios' must be provided in the dataset."
@@ -1267,7 +1250,6 @@ class Qwen3TTSTemplate(Template):
         Combines the talker codec_0 cross-entropy loss with the sub-talker loss
         using a fixed weighting factor of 0.3.
         """
-        # Extract speaker_embedding from ref_mels and cache for checkpoint post-processing
         if 'ref_mels' in inputs:
             base_model = model.module if hasattr(model, 'module') else model
             with torch.no_grad():
@@ -1296,19 +1278,16 @@ class Qwen3TTSTemplate(Template):
         base_model = unwrap_model(model)
         state_dict = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
 
-        # 1. Drop speaker_encoder keys
         keys_to_drop = [k for k in state_dict if k.startswith('speaker_encoder')]
         for k in keys_to_drop:
             del state_dict[k]
 
-        # 2. Inject target_speaker_embedding into codec_embedding.weight[3000]
         emb_key = 'talker.model.codec_embedding.weight'
         if self.target_speaker_embedding is not None and emb_key in state_dict:
             weight = state_dict[emb_key]
             state_dict[emb_key][3000] = self.target_speaker_embedding[0].to(weight.dtype)
 
         save_file(state_dict, os.path.join(output_dir, 'model.safetensors'))
-        # Save config
         with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as f:
             json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
@@ -1334,7 +1313,6 @@ class Qwen3TTSTemplate(Template):
             text_ids_len = len(text_ids)
             codec_ids_len = audio_codec_0.shape[0]
 
-            # === Text channel ===
             input_ids[i, :3, 0] = text_ids[:3]
             input_ids[i, 3:7, 0] = self._tts_pad_token_id
             input_ids[i, 7, 0] = self._tts_bos_token_id
@@ -1343,7 +1321,6 @@ class Qwen3TTSTemplate(Template):
             input_ids[i, 8 + text_ids_len - 2:8 + text_ids_len + codec_ids_len, 0] = self._tts_pad_token_id
             text_embedding_mask[i, :8 + text_ids_len + codec_ids_len] = True
 
-            # === Codec channel ===
             input_ids[i, 3:8, 1] = torch.tensor([
                 self._codec_nothink_id,
                 self._codec_think_bos_id,
@@ -1357,14 +1334,11 @@ class Qwen3TTSTemplate(Template):
             input_ids[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len, 1] = audio_codec_0
             input_ids[i, 8 + text_ids_len - 1 + codec_ids_len, 1] = self._codec_eos_token_id
 
-            # === Labels (codec layer 0) ===
             codec_0_labels[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len] = audio_codec_0
             codec_0_labels[i, 8 + text_ids_len - 1 + codec_ids_len] = self._codec_eos_token_id
 
-            # === Sub-talker codec IDs ===
             codec_ids[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len, :] = audio_codes
 
-            # === Masks ===
             codec_embedding_mask[i, 3:8 + text_ids_len + codec_ids_len] = True
             codec_embedding_mask[i, 6] = False  # speaker embedding position
             codec_mask[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len] = True
@@ -1425,7 +1399,7 @@ class Ovis1_6Template(Template):
         if pixel_values:
             pixel_values = torch.cat(pixel_values, dim=0).to(dtype)
         else:
-            pixel_values = torch.zeros((1, 3, 384, 384), dtype=dtype)  # dummpy
+            pixel_values = torch.zeros((1, 3, 384, 384), dtype=dtype)
         encoded.update({'input_ids': input_ids, 'labels': labels})
         encoded['pixel_values'] = [pixel_values]
         return encoded
@@ -1440,7 +1414,7 @@ class Ovis1_6Template(Template):
             labels = input_ids.new_full(input_ids.shape, -100)
         _, inputs_embeds, labels, attention_mask = model.merge_multimodal(
             text_input_ids=input_ids,
-            text_attention_masks=torch.ones_like(input_ids),  # not use, only compat
+            text_attention_masks=torch.ones_like(input_ids),
             text_labels=labels,
             pixel_values=inputs['pixel_values'],
             left_padding=padding_side == 'left')

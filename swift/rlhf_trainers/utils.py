@@ -41,7 +41,6 @@ T = TypeVar('T')
 
 _ipv6_patch_applied = False
 
-# Constants for the RL training LoRA adapter identity.
 VLLM_LORA_INT_ID = 111
 VLLM_LORA_NAME = 'swift_lora'
 VLLM_LORA_PATH = 'swift_dummy_lora_path'
@@ -117,23 +116,19 @@ def resolve_hostname(hostname: str) -> str:
     Uses socket.getaddrinfo() which supports both IPv4 and IPv6,
     unlike socket.gethostbyname() which only supports IPv4.
     """
-    # If it's already an IP address (IPv4 or IPv6), return as-is
     try:
         ipaddress.ip_address(hostname)
         return hostname
     except ValueError:
         pass
 
-    # Resolve hostname using getaddrinfo (supports both IPv4 and IPv6)
     try:
         addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
         if addr_info:
-            # Return the first resolved address
             return addr_info[0][4][0]
     except socket.gaierror:
         pass
 
-    # Fallback to original hostname if resolution fails
     return hostname
 
 
@@ -160,7 +155,6 @@ def patch_stateless_process_group_for_ipv6():
     # vLLM >= 0.19.0: create() accepts listen_socket and handles TCPStore internally
     _has_listen_socket_param = 'listen_socket' in inspect.signature(StatelessProcessGroup.create).parameters
 
-    # Save original method for fallback
     _original_create = StatelessProcessGroup.create
 
     @staticmethod
@@ -177,7 +171,6 @@ def patch_stateless_process_group_for_ipv6():
 
         For IPv4 addresses, falls back to the original implementation.
         """
-        # If not IPv6, use original implementation
         if not is_valid_ipv6_address(host):
             return _original_create(
                 host=host,
@@ -189,7 +182,6 @@ def patch_stateless_process_group_for_ipv6():
                 **kwargs,
             )
 
-        # IPv6 path: create an AF_INET6 socket
         launch_server = rank == 0
         if launch_server:
             listen_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -234,13 +226,11 @@ def patch_stateless_process_group_for_ipv6():
                 data_expiration_seconds=data_expiration_seconds,
             )
 
-    # Apply the monkey patch to vLLM
     StatelessProcessGroup.create = _patched_stateless_pg_create
 
     _ipv6_patch_applied = True
 
 
-# Apply IPv6 patch at module load time
 patch_stateless_process_group_for_ipv6()
 
 
@@ -261,32 +251,25 @@ def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> Non
         return
 
     for attempt in range(max_retries):
-        # Record memory status before cleanup
         before_reserved = device.memory_reserved()
         before_allocated = device.memory_allocated()
 
-        # Run garbage collection
         gc_collect()
 
-        # Clear PyTorch cache
         device.empty_cache()
 
-        # Force synchronization (optional)
         if force_sync:
             device.synchronize()
 
-        # Record memory status after cleanup
         after_reserved = device.memory_reserved()
         after_allocated = device.memory_allocated()
 
-        # Calculate freed memory
         reserved_freed = before_reserved - after_reserved
         allocated_freed = before_allocated - after_allocated
 
         logger.info(f'Memory cleanup attempt {attempt + 1}: Freed {reserved_freed / 1024**3:.2f} GB reserved, '
                     f'{allocated_freed / 1024**3:.2f} GB allocated')
 
-        # Stop retrying if little memory was freed
         if reserved_freed < 1024**3:  # less than 1GB
             break
 
@@ -314,27 +297,21 @@ def prepare_deepspeed(model, accelerator, deepspeed_config=None, deepspeed_plugi
     except ImportError:
         pass
 
-    # Determine which config to use and create HfTrainerDeepSpeedConfig
     if deepspeed_config is not None:
-        # Use provided config - need to wrap it with HfTrainerDeepSpeedConfig to handle "auto" values
+        # Wrap the supplied config to resolve DeepSpeed "auto" values.
         if isinstance(deepspeed_config, dict):
-            # Create HfTrainerDeepSpeedConfig which will handle "auto" values
             hf_ds_config = HfTrainerDeepSpeedConfig(deepspeed_config)
 
-            # Process the config with training args to resolve "auto" values
             if training_args is not None:
                 hf_ds_config.trainer_config_process(training_args)
 
-            # Create a DeepSpeedPlugin with the processed config
             temp_plugin = DeepSpeedPlugin(hf_ds_config=hf_ds_config)
             config_kwargs = deepcopy(temp_plugin.deepspeed_config)
         else:
             raise ValueError(f'deepspeed_config should be a dict, got {type(deepspeed_config)}')
     elif deepspeed_plugin is not None:
-        # Use provided plugin
         config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
     else:
-        # Use accelerator's plugin (default behavior)
         deepspeed_plugin = accelerator.state.deepspeed_plugin
         config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
 
@@ -354,15 +331,11 @@ def prepare_deepspeed(model, accelerator, deepspeed_config=None, deepspeed_plugi
                 'zero_optimization.stage3_prefetch_bucket_size': 0.9 * hidden_size * hidden_size,
             })
 
-    # If ZeRO-3 is used, we shard both the active and reference model.
-    # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO
-    # disabled (stage 0)
+    # Shard reference weights only under ZeRO-3; otherwise initialize a full replica per device.
     if stage != 3:
         config_kwargs['zero_optimization']['stage'] = 0
 
-    # CRITICAL: Save and clear DeepSpeed-related environment variables before initialization
-    # These environment variables (set during student model's DeepSpeed init) can override our config!
-    # Reference: https://github.com/microsoft/DeepSpeed/issues/xxxx
+    # Clear student DeepSpeed environment settings so they cannot override the reference config.
     env_vars_to_clear = [
         'DEEPSPEED_ZERO_STAGE',
         'DEEPSPEED_CONFIG',
@@ -375,12 +348,10 @@ def prepare_deepspeed(model, accelerator, deepspeed_config=None, deepspeed_plugi
             del os.environ[env_var]
 
     try:
-        # Explicitly pass args=None to ensure no args.deepspeed_config interference
         model, *_ = deepspeed.initialize(args=None, model=model, config=config_kwargs)
         model.eval()
 
     finally:
-        # Restore environment variables
         for env_var, value in saved_env.items():
             os.environ[env_var] = value
 
@@ -412,13 +383,11 @@ def memory_time_profiling_context(
 
     logger = get_logger()
 
-    # ===== Entry phase: Record initial state =====
     if sync_cuda:
         synchronize()
 
     gc_collect()
 
-    # Record initial memory state
     memory_before = torch.cuda.memory_allocated() / 1024**3  # GiB
     memory_reserved_before = torch.cuda.memory_reserved() / 1024**3
     max_memory_before = torch.cuda.max_memory_allocated() / 1024**3
@@ -428,21 +397,16 @@ def memory_time_profiling_context(
                 f'Reserved = {memory_reserved_before:.2f} GiB, '
                 f'Peak = {max_memory_before:.2f} GiB')
 
-    # Start timing
     start_time = time.perf_counter()
 
     yield
 
-    # Synchronize and clean up memory before measuring (important for offload operations)
     if sync_cuda:
         synchronize()
     gc_collect()
 
-    # ===== Exit phase: Record final state =====
-    # Calculate elapsed time (before cleanup to measure actual operation time)
     elapsed_time = time.perf_counter() - start_time
 
-    # Record final memory state
     memory_after = torch.cuda.memory_allocated() / 1024**3
     memory_reserved_after = torch.cuda.memory_reserved() / 1024**3
     peak_memory = torch.cuda.max_memory_allocated() / 1024**3
@@ -455,7 +419,6 @@ def memory_time_profiling_context(
                 f'Change = {memory_change:+.2f} GiB, '
                 f'Time = {elapsed_time:.2f}s')
 
-    # Reset peak memory statistics for next cycle
     if reset_peak_stats and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
@@ -505,14 +468,12 @@ def patch_lora_merge(model, parameter_group=None):
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         if parameter_group and all(self.name not in pg for pg in parameter_group):
-            return  # Skip if not in target parameter group
+            return
         for active_adapter in check_adapters_to_merge(self, adapter_names) or []:
-            # Align adapter sublayers (lora_A/B, DoRA magnitude, ...) to the base device.
-            # Type-agnostic: ParamWrapper overrides this to use get_param().device.
+            # Place adapter sublayers on the base device; ParamWrapper uses get_param().device.
             self._move_adapter_to_device_of_base_layer(active_adapter)
         return self.merge_origin(safe_merge, adapter_names)
 
-    # Patch all LoraLayer instances
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
             module.name = name
@@ -523,7 +484,6 @@ def patch_lora_merge(model, parameter_group=None):
     try:
         yield model
     finally:
-        # Cleanup: restore original methods
         for module in model.modules():
             if isinstance(module, LoraLayer) and hasattr(module, 'merge_origin'):
                 module.merge = module.merge_origin
@@ -542,7 +502,6 @@ def patch_lora_unmerge(model):
     def unmerge_patched(self):
         if not self.merged:
             return
-        # Move adapter sublayers (incl. DoRA magnitude) to the base device first
         for adapter in list(self.merged_adapters):
             self._move_adapter_to_device_of_base_layer(adapter)
         return self.unmerge_origin()
@@ -630,10 +589,8 @@ class _ForwardRedirection:
         original_forward = original_module.forward
 
         def wrapped_forward(*_args: Any, **_kwargs: Any) -> Any:
-            # Unpatch ourselves immediately before calling the method `method_name`
-            # because itself may want to call the real `forward`
+            # Unpatch before invoking the method, which may call the real forward.
             original_module.forward = original_forward  # type: ignore[method-assign]
-            # Call the actual method e.g. `.training_step(...)`
             out = method(*_args, **_kwargs)
             self.on_after_inner_forward(wrapper_module, original_module)
             return out
@@ -744,8 +701,7 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
         data['messages'] = replace_assistant_response_with_ids(
             msgs, sample.response_token_ids, loss_mask, non_thinking_prefix_ids=prefix_ids,
             prefix_included=response_prefix_included(sample))
-        # Assistant turns left as strings (history not carried as sampled ids) are
-        # context only: never train on them.
+        # String assistant history is context only; never include it in the loss.
         for message in data['messages'] or []:
             if message.get('role') == 'assistant' and isinstance(message.get('content'), str):
                 message['loss'] = False
@@ -759,12 +715,8 @@ def encode_sample(sample: OnPolicySample, template: Template, *, encode_prompt_o
     loss_scale = getattr(template, 'loss_scale', None)
     if not history_as_text or loss_scale is None or loss_scale.base_strategy == 'last_round':
         return template.encode(data, return_length=True)
-    # Under a non-last-round strategy the training template keeps history thinking and
-    # prefixes every assistant round with the non-thinking prefix, whereas rollout
-    # (inference mode) only touches the last round. Render string history the rollout
-    # way; token-id turns keep their explicit loss_scale either way.
-    # Override for this thread only: concurrent encodes (SWIFT_ENCODE_WORKERS > 1)
-    # must not observe each other's strategy.
+    # Render string history as rollout did, retaining explicit token-ID loss scales.
+    # Use a thread-local strategy override to isolate concurrent encodes.
     override = getattr(loss_scale, 'thread_local_strategy', None)
     if override is not None:
         with override('last_round'):
@@ -789,7 +741,7 @@ def encode_samples(samples, template, encode_fn=None) -> None:
 
     def _encode_one(sample):
         encoded = encode_fn(sample, template)
-        encoded.pop('_extra_kwargs', None)  # pop add_eos
+        encoded.pop('_extra_kwargs', None)
         sample.encoded = encoded
 
     workers = int(os.environ.get('SWIFT_ENCODE_WORKERS', '1') or 1)
@@ -854,8 +806,7 @@ def replace_assistant_response_with_ids(messages: 'Messages',
         [{'role': 'user', 'content': 'Hello'},
          {'role': 'assistant', 'content': {'input_ids': [1, 2, 3], 'loss_scale': [1, 1, 0]}}]
     """
-    # Normalize input to always be list of lists and copy it. Prefix injection below
-    # must not mutate the sample's raw rollout token/mask frame.
+    # Copy nested token/mask lists before injecting prefixes.
     if isinstance(completion_ids[0], int):
         completion_ids = [list(completion_ids)]
     else:
@@ -865,10 +816,8 @@ def replace_assistant_response_with_ids(messages: 'Messages',
     elif loss_mask:
         loss_mask = [list(mask) for mask in loss_mask]
 
-    # Inject the response prefix (e.g. '<think>\n' or '<think>\n\n</think>\n\n') into the LAST
-    # assistant turn: the generation prompt supplied it, so sampled ids never contain it.
-    # Whether ids already hold it is a property of their source (``prefix_included``), not of
-    # their first tokens: a model may itself sample the same tokens again after the prompt's.
+    # The generation prompt supplies the final response prefix. Use prefix_included
+    # to detect it; matching initial tokens may have been independently sampled.
     if non_thinking_prefix_ids and not prefix_included:
         n_prefix = len(non_thinking_prefix_ids)
         if loss_mask is None:
@@ -892,7 +841,6 @@ def replace_assistant_response_with_ids(messages: 'Messages',
         if completion_index >= remaining_completions:
             break
 
-        # Assign completion IDs (starting from last)
         if loss_mask:
             message['content'] = {
                 'loss_scale': loss_mask[-1 - completion_index],
@@ -1095,9 +1043,7 @@ def patch_vllm_moe_model_weight_loader(model, *, load_preprocessed_weight: bool 
         load_preprocessed_weight: Whether Ascend MoE expert loaders should write
             checkpoint layout for a subsequent post-load processing pass.
     """
-    # Check if already patched (idempotent). On NPU/vLLM-Ascend, sleep/wake
-    # and full-model reload can recreate expert Parameters while keeping this
-    # model-level flag, so the loader needs to be reattached every reload.
+    # NPU reloads can replace expert Parameters while retaining the model-level patch flag.
     if getattr(model, '_swift_moe_weight_loader_patched', False) and not is_torch_npu_available():
         return
 
@@ -1109,27 +1055,22 @@ def patch_vllm_moe_model_weight_loader(model, *, load_preprocessed_weight: bool 
     original_model = model
     original_model_type = type(model)
 
-    # Handle NPU ACLGraphWrapper (for vllm_ascend compatibility)
     if hasattr(model, 'runnable') and 'ACLGraphWrapper' in str(original_model_type):
         model = model.runnable
         original_model_type = type(model)
 
-    # Get inner model (either model.model or model.language_model)
     inner_model = getattr(model, 'model', None) or getattr(model, 'language_model', None)
     if inner_model is None:
-        # Model structure not recognized, skip patching
         return
 
     if not isinstance(model, tuple(supported_moe_models)) and not isinstance(inner_model, tuple(supported_moe_models)):
         return
 
-    # Handle Qwen3-VL MoE structure
     if type(inner_model).__name__ == 'Qwen3MoeLLMForCausalLM':
         inner_model = inner_model.model
     if type(inner_model).__name__ == 'Qwen3_5MoeForCausalLM':
         inner_model = inner_model.model
 
-    # Check if inner_model has layers attribute
     if not hasattr(inner_model, 'layers'):
         return
 
@@ -1155,14 +1096,12 @@ def patch_vllm_moe_model_weight_loader(model, *, load_preprocessed_weight: bool 
         if not experts or not hasattr(experts, 'weight_loader'):
             continue
 
-        # Patch the weight loaders for MoE expert weights
         for name, param in mlp.named_parameters():
             if 'w13_weight' in name or 'w2_weight' in name:
                 if not hasattr(param, 'weight_loader'):
                     param.weight_loader = experts.weight_loader
                 maybe_patch_vllm_ascend_moe_expert_weight_loader(experts, name, param)
 
-    # Mark the model as patched (for idempotency)
     original_model._swift_moe_weight_loader_patched = True
 
 
@@ -1208,9 +1147,7 @@ def _build_reverse_renamings(model):
     if not renamings:
         return None
 
-    # Reverse order before inverting, matching transformers' own revert_weight_conversion
-    # (core_model_loading.py) which reverses the list so that chained renamings undo
-    # in the correct order.
+    # Invert renamings in reverse order to undo chained conversions.
     try:
         _cached_reverse_renamings = [c.reverse_transform() for c in renamings[::-1]]
     except Exception as e:
@@ -1241,7 +1178,6 @@ def revert_runtime_names_to_checkpoint(model, state_dict):
     checkpoint names still maps correctly. Any failure or absence of conversions
     is a no-op that returns the input unchanged.
     """
-    # Unwrap PEFT to reach the underlying transformers model that holds conversions.
     if hasattr(model, 'get_base_model'):
         try:
             model = model.get_base_model()
@@ -1301,7 +1237,6 @@ def patch_vllm_load_adapter():
                 else:
                     expected_lora_modules.append(module)
             expected_lora_modules = list(set(expected_lora_modules))
-            # this is the patch
             lora_tensors = None
             from vllm.lora.peft_helper import PEFTHelper
             if isinstance(lora_request, TensorLoRARequest):
@@ -1311,8 +1246,6 @@ def patch_vllm_load_adapter():
             else:
                 lora_path = get_adapter_absolute_path(lora_request.lora_path)
                 peft_helper = PEFTHelper.from_local_dir(lora_path, self.max_position_embeddings)
-            # Validates the LoRA configuration against requirements before
-            # loading weights, throwing an exception if validation fails.
             peft_helper.validate_legal(self.lora_config)
             # For some models like Qwen2VL, we need to use hf_to_vllm_mapper
             # to ensure correct loading of lora weights.
@@ -1425,7 +1358,6 @@ class FlattenedTensorMetadata(BaseModel):
     @field_validator('dtype', mode='before')
     @classmethod
     def ensure_dtype_str(cls, v: Any) -> str:
-        # accept torch.dtype or str
         if torch is not None and isinstance(v, torch.dtype):
             return str(v)
         if isinstance(v, str):
@@ -1493,7 +1425,6 @@ class FlattenedTensorBucket:
 
             self.flattened_tensor = torch.cat(flattened_chunks, dim=0)
         else:
-            # Initialize from pre-flattened data
             if flattened_tensor is None or metadata is None:
                 raise ValueError('Must provide either named_tensors or both flattened_tensor and metadata')
             self.flattened_tensor = flattened_tensor
@@ -1512,7 +1443,6 @@ class FlattenedTensorBucket:
         Reconstruct original tensors from flattened tensor with optimized performance.
         Uses memory-efficient operations to minimize allocations and copies.
         """
-        # preallocate the result list
         reconstructed = {}
 
         for meta in self.metadata:
@@ -1543,11 +1473,9 @@ def mu_schedule_function(global_step: int, mu_warmup_steps: int, mu_decay_steps:
     Returns:
         Current mu value based on the schedule
     """
-    # Warmup
     if global_step < mu_warmup_steps:
         return (global_step / mu_warmup_steps) * mu_peak
 
-    # Decay
     if global_step >= (mu_warmup_steps + mu_decay_steps):
         return mu_valley
 
@@ -1722,7 +1650,6 @@ def set_expandable_segments(enable: bool) -> None:
 def peft_config_to_dict(peft_config):
     if not isinstance(peft_config, dict):
         peft_config = asdict(peft_config)
-    # turn set to list to serializable
     if 'target_modules' in peft_config and isinstance(peft_config['target_modules'], set):
         peft_config['target_modules'] = list(peft_config['target_modules'])
 
@@ -1739,7 +1666,6 @@ def _create_parameter_buckets(named_params, bucket_size_mb=512):
     for name, param in named_params:
         param_size = param.numel() * param.element_size()
 
-        # If adding this param would exceed bucket size, process current bucket first
         if current_size + param_size > bucket_size_bytes and current_bucket:
             buckets.append(current_bucket)
             current_bucket = []
@@ -1748,7 +1674,6 @@ def _create_parameter_buckets(named_params, bucket_size_mb=512):
         current_bucket.append((name, param))
         current_size += param_size
 
-    # Process remaining parameters in the last bucket
     if current_bucket:
         buckets.append(current_bucket)
 
@@ -1760,22 +1685,17 @@ def _process_bucket_with_flattened_tensor(trainer, bucket_params):
     if not bucket_params:
         return
 
-    # Create FlattenedTensorBucket for efficient processing
     bucket = FlattenedTensorBucket(named_tensors=bucket_params)
     metadatas = bucket.get_metadata()
     flattened_tensor = bucket.get_flattened_tensor()
 
-    # Use the new flattened parameter update method
-    # If not available, fall back to individual parameter updates
     try:
         trainer.vllm_client.update_flattened_params(metadatas, flattened_tensor)
     except AttributeError:
-        # Fallback to individual parameter updates
         reconstructed = bucket.reconstruct_tensors()
         for name, param in reconstructed.items():
             trainer.vllm_client.update_named_param(name, param)
 
-    # Clean up
     del bucket, metadatas, flattened_tensor
 
 
@@ -1800,11 +1720,9 @@ def get_even_process_data(trainer, global_data: List[T]) -> List[T]:
     base_size = total // num_procs
     remainder = total % num_procs
 
-    # Calculate the number of samples that need to be padded
-    # This ensures all processes have the same number of samples for gather operations
+    # Equal sample counts are required for gather operations.
     trainer.rollout_pad_count = 0
     if remainder > 0 and proc_idx >= remainder:
-        # Processes with extra samples need padding
         trainer.rollout_pad_count = 1
 
     if proc_idx < remainder:
@@ -1838,9 +1756,6 @@ def vllm_supports_lora_load_inplace() -> bool:
     return check_vllm_version_ge('0.15.0')
 
 
-# ============================================================================
-# Padding-free utilities
-# ============================================================================
 
 
 def pad_logps_back_to_batch(logps_rmpad: Optional[torch.Tensor],
@@ -1877,37 +1792,27 @@ def pad_logps_back_to_batch(logps_rmpad: Optional[torch.Tensor],
 
     device = logps_rmpad.device
 
-    # Determine sequence lengths
     if seq_lengths is not None:
-        # Use provided seq_lengths directly - they should already be adjusted
-        # by the caller (e.g., in _generate_and_score_completions)
-        # DO NOT adjust again here to avoid double adjustment
+        # Caller-provided sequence lengths are already adjusted for logits_to_keep.
         pass
     else:
-        # Fallback: infer from position_ids
         cu_seqlens = get_cu_seqlens_from_position_ids(position_ids)
 
-        # Adjust cu_seqlens for logits_to_keep if needed
         total_length = cu_seqlens[-1].item()
         if total_length > logits_to_keep:
-            # Adjust the first sequence length
             adjustment = total_length - logits_to_keep
             cu_seqlens = cu_seqlens - adjustment
-            cu_seqlens[0] = 0  # First element should always be 0
+            cu_seqlens[0] = 0
 
-        # Compute actual sequence lengths
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
 
-    # Compute cumulative sequence lengths
     cu_seqlens = torch.cumsum(torch.cat([torch.tensor([0], device=device), seq_lengths]), dim=0)
-    max_seq_len = logits_to_keep  # All sequences will be padded to this length
+    max_seq_len = logits_to_keep
 
-    # Initialize output tensors with padding value
     logps_padded = torch.full((batch_size, max_seq_len), pad_value, dtype=dtype, device=device)
     valid_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32, device=device)
 
-    # Unflatten: assign each sequence's logps to the corresponding row
-    # Use LEFT PADDING (right-align the data) to match the standard padding convention
+    # Left-pad each sequence to match the standard padding convention.
     logps_flat = logps_rmpad.squeeze(0)  # [total_nnz]
 
     for i in range(batch_size):
@@ -1921,19 +1826,13 @@ def pad_logps_back_to_batch(logps_rmpad: Optional[torch.Tensor],
         if actual_len <= 0:
             continue
 
-        # Left padding: place data at the RIGHT side of the row
-        # pad_len is the number of padding tokens at the beginning
         pad_len = max_seq_len - seq_len
 
         if actual_len < seq_len:
-            # Input data is shorter than expected seq_len
-            # This happens when logps_flat doesn't have enough data
-            # Place actual data at the rightmost positions
             data_pad_len = max_seq_len - actual_len
             logps_padded[i, data_pad_len:] = logps_flat[start_idx:actual_end_idx]
             valid_mask[i, data_pad_len:] = 1.0
         else:
-            # Normal case: seq_len tokens of data
             logps_padded[i, pad_len:] = logps_flat[start_idx:end_idx]
             valid_mask[i, pad_len:] = 1.0
 
@@ -2033,9 +1932,7 @@ def build_completion_mask_and_seq_lengths(
         completion_mask = completion_mask.bool()
     else:
         completion_mask = completion_mask_raw
-        # Non-padding-free HF frame: every row spans the full region. Return real
-        # per-sample lengths (= region width) instead of an empty tensor, so callers
-        # can treat seq_lengths uniformly regardless of padding_free.
+        # Return full-region lengths for non-padding-free batches so callers can use seq_lengths uniformly.
         seq_lengths = torch.full((batch_size, ), logits_to_keep, dtype=torch.int64, device=device)
     return completion_mask, seq_lengths, max_seq_len
 
@@ -2312,9 +2209,8 @@ def collate_to_grpo_micro_batch(
     non-Ray via batch forward, Ray by stacking per-sample remote results. No
     distributed communication happens here.
     """
-    # The collator pops per-sample fields (``image_grid_thw``, ``video_grid_thw``, ...) and,
-    # under Megatron CP, rewrites ``length``. Collate shallow copies so ``s.encoded`` stays
-    # complete for the multimodal loss chunks that re-collate it.
+    # Collate shallow copies: the collator removes media grids and rewrites lengths,
+    # but multimodal loss chunks still need each sample's original encoding.
     encoded_list = [dict(s.encoded) for s in samples]
     expected_lens = [e.get('length') for e in encoded_list]
     model_inputs = to_device(template.data_collator(encoded_list, padding_to=padding_to), device)

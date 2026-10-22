@@ -238,8 +238,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         self._teacher_use_disable_adapter = getattr(self, '_teacher_use_disable_adapter', False)
         self._is_self_distillation = (teacher_model is None and teacher_model_server is None)
         explicit = self._has_teacher_explicit()
-        # Dynamic OPD-RL capability (no explicit teacher): student-as-teacher OPSD when a batch
-        # has ``teacher_prompt``; plain reward GRPO skips teacher forwards when OPSD is absent.
+        # Use the student as an OPSD teacher only for batches containing teacher_prompt.
         self._is_dynamic_self_distillation = resolve_dynamic_opd_self_distillation(
             has_teacher_explicit=explicit,
             is_self_distillation=self._is_self_distillation,
@@ -249,7 +248,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         self.teacher_clients: List[VLLMInferClient] = []
         self.teacher_configs: List[TeacherServerConfig] = []
         if self.use_teacher_api:
-            # Parse teacher config (single URL -> list of 1; JSON -> list of N).
             self.teacher_configs = parse_teacher_model_server(teacher_model_server)
             if self.accelerator.is_main_process:
                 self.teacher_clients = [VLLMInferClient(base_urls=[cfg.url]) for cfg in self.teacher_configs]
@@ -310,7 +308,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         Safe to call concurrently across teachers (distinct clients, no collective inside).
         ``topk == 0`` -> the sampled token's logp (OPD-RL); ``topk > 0`` -> top-k (GKD).
         """
-        if not handle['all_requests']:  # no sample routed to this teacher: skip the empty HTTP call
+        if not handle['all_requests']:
             return []
         client = teacher_client if teacher_client is not None else self.teacher_clients[0]
         request_config = RequestConfig(prompt_logprobs=topk, max_tokens=1, temperature=0.0)
@@ -375,11 +373,10 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size
         self.max_completion_length = args.max_completion_length
         self.completion_length_limit_scope = None
-        if hasattr(args, 'completion_length_limit_scope'):  # GRPO colocate
+        if hasattr(args, 'completion_length_limit_scope'):
             self.completion_length_limit_scope = args.completion_length_limit_scope
         self.async_generate = args.async_generate
 
-        # Enable logprobs for vLLM importance sampling if requested
         structured_outputs_regex = getattr(args, 'structured_outputs_regex', None)
 
         self.request_config = RequestConfig(
@@ -401,7 +398,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         """Initialize vLLM engine (server or colocate mode)"""
         args = self.args
         self.use_fast_infer = args.use_vllm
-        # Initialize default values
         self.enable_offload = False
         self.use_gym_env = False
         self.enable_server_multi_turn = False
@@ -414,7 +410,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         self.base_sync_done = False
         self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         self._cached_vllm_param_names = None
-        # split model parameters into batches for synchronized weight transfer / ref sync
         if not args.use_vllm:
             infer_template = copy(self.template)
             infer_template.padding_free = False
@@ -469,11 +464,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                     for i in range(self.accelerator.num_processes // self.vllm_tensor_parallel_size)
                 ])
             self.enable_offload = args.offload_model or args.offload_optimizer
-            # At init (prepare_rollout, before accelerator.prepare()) an FSDP2
-            # model is still full-sized on CPU — sharding hasn't happened yet.
-            # Skip the offload context entirely: both the offload and the reload
-            # are pointless here, and reloading the full model onto a single card
-            # would OOM. train()'s accelerator.prepare() will shard and load it.
+            # FSDP2 is not yet sharded during initialization; reloading its full CPU model onto one GPU can OOM.
             if self.enable_offload and not self._is_fsdp2:
                 rollout_cm = self.offload_context()
             else:
@@ -529,7 +520,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
 
         with Swift.grpo_context(model, self.template.processor):
             set_expandable_segments(False)
-            # Use load_format from vllm_engine_kwargs if provided, otherwise default to 'auto'
             vllm_engine_kwargs = self.args.vllm_engine_kwargs or {}
             load_format = vllm_engine_kwargs.pop('load_format', 'auto')
             engine = GRPOVllmEngine(
@@ -686,7 +676,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         self._reset_vllm_cache()
 
     def _reset_vllm_cache(self):
-        # Reset prefix cache and encoder cache after weight update
         vllm_ge_16 = check_vllm_version_ge('0.16')
         if self.vllm_mode == 'server' and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
@@ -829,26 +818,20 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             from swift.model.npu_patch.vllm_ascend_moe import expand_fused_moe_expert_weight_for_vllm_ascend
             expand_fused_moe_expert_weight = expand_fused_moe_expert_weight_for_vllm_ascend
         for name, param in state_dict.items():
-            # Clean up parameter name for PEFT models
             clean_name = name.removeprefix('base_model.model.')
-            # Only remove .base_layer when vLLM LoRA is disabled
-            # When vLLM LoRA is enabled, the model params have .base_layer suffix
+            # Keep .base_layer suffixes when vLLM LoRA is enabled.
             if not self.rollout_enable_lora:
                 clean_name = clean_name.replace('.base_layer', '')
 
-            # Skip PEFT adapter layers (unless we need to keep them for later merge)
             if is_peft and not keep_lora_weights and self.model.prefix in clean_name:
                 continue
 
-            # Skip original_module entries when modules_to_save is used
             if 'original_module' in clean_name:
                 continue
 
-            # Fix checkpoint wrapper prefixes
             clean_name = self._fix_param_name_to_vllm(clean_name)
             clean_name = clean_name.replace('modules_to_save.default.', '')
 
-            # Convert DTensor to regular Tensor if needed (FSDP2)
             if hasattr(param, 'full_tensor'):
                 if param.is_cpu:
                     param = param.to(get_current_device())
@@ -881,12 +864,10 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         merged = {}
         lora_keys = set()
 
-        # Find all LoRA modules and compute delta weights
         for name, module in self.model.named_modules():
             if not isinstance(module, LoraLayer):
                 continue
 
-            # Get the base layer key in state_dict
             base_name = name.removeprefix('base_model.model.')
             if not self.rollout_enable_lora:
                 base_name = base_name.replace('.base_layer', '')
@@ -903,7 +884,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             if active_adapter not in module.lora_A:
                 continue
 
-            # Get LoRA weights from state_dict (already converted from DTensor)
             lora_a_key = f'{base_name}.lora_A.{active_adapter}.weight'
             lora_b_key = f'{base_name}.lora_B.{active_adapter}.weight'
 
@@ -921,14 +901,13 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             delta_weight = (lora_B @ lora_A) * scaling
             merged[weight_key] = base_weight + delta_weight.to(base_weight.dtype)
 
-        # Copy non-LoRA keys and non-merged base weights
         for key, value in state_dict.items():
             if key in lora_keys:
-                continue  # Skip LoRA adapter weights
+                continue
             if key in merged:
-                continue  # Already merged
+                continue
             if self.model.prefix in key:
-                continue  # Skip other adapter keys
+                continue
             merged[key] = value
 
         return merged
@@ -969,14 +948,12 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                     continue
                 raw_state_dict[name] = param.data
 
-        # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
         state_dict = self._process_state_dict_for_vllm(raw_state_dict, is_peft, keep_lora_weights=should_merge_lora)
 
         # FSDP2 + LoRA: merge at tensor level (avoids issues with merge/unmerge on DTensor)
         if should_merge_lora:
             state_dict = self._merge_lora_into_state_dict(state_dict)
 
-        # Filter by parameter_group_no_lora
         if parameter_group_no_lora:
             if is_peft:
                 parameter_group_no_lora = [n.replace('base_model.model.', '') for n in parameter_group_no_lora]
@@ -992,10 +969,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         if is_peft:
             assert len(state_dict) > 0 and all([state.shape != torch.Size([0]) for state in state_dict.values()])
 
-        # Revert transformers runtime param names back to checkpoint names so vLLM's
-        # hf_to_vllm_mapper (built for checkpoint names) maps them correctly. Fixes
-        # online weight sync for models like gemma4_unified where runtime names differ
-        # from checkpoint names (transformers>=5 conversion mapping). No-op otherwise.
+        # Restore checkpoint parameter names before applying vLLM's hf_to_vllm_mapper.
         state_dict = revert_runtime_names_to_checkpoint(self.accelerator.unwrap_model(self.model), state_dict)
 
         return state_dict
@@ -1019,9 +993,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             ascend_reload_runner = get_vllm_ascend_reload_runner(self.engine)
         if self.vllm_mode == 'colocate':
             if ascend_reload_runner is None:
-                # Legacy vLLM-Ascend and GPU keep the existing in-place reload
-                # path. The Ascend fallback loader writes directly into the
-                # processed MoE layout and guards its redundant post-load.
+                # Ascend's fallback loader writes the processed MoE layout and guards redundant post-loading.
                 patch_vllm_moe_model_weight_loader(self.engine.inner_model)
 
         def iter_state_dicts():
@@ -1156,16 +1128,13 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
             return self._postprocess_rollout_outputs(samples, rollout_outputs)
 
-        # Multi-turn: call on_trajectory_start BEFORE first turn generation
-        # so the model sees the actual environment question, not the placeholder.
+        # Initialize the trajectory before generating so the model sees the environment question.
         requests = self.samples2requests(samples)
         invoke_async_hook(self.multi_turn_scheduler.on_trajectory_start(requests))
 
-        # Update inputs with actual messages from requests (e.g. env question)
         for req, sample in zip(requests, samples):
             sample.messages = req.messages
 
-        # Generate first turn with actual questions
         first_turn_rollout_outputs: List[RolloutOutput] = self._rollout(samples, request_config, is_global_inputs)
 
         return self._colocate_multi_turn_infer(samples, first_turn_rollout_outputs, request_config, requests,
@@ -1200,8 +1169,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         if finalize_rollout is not None:
             finalized_outputs = []
             for request, output in zip(requests, rollout_outputs):
-                # Synchronous engines reuse batch-local response ids; restore the trajectory
-                # identity before one trajectory is split into several training samples.
+                # Restore request IDs before splitting: synchronous engines return batch-local IDs.
                 output.response.id = request.uuid
                 result = finalize_rollout(request, request_config, output)
                 finalized_outputs.extend(result if isinstance(result, list) else [result])
@@ -1235,7 +1203,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         return result
 
     def _generate_completions(self, samples: List[OnPolicySample]) -> List[OnPolicySample]:
-        # add prompt ids and system prompts
         samples = self._preprocess_inputs(samples)
 
         mode = 'train' if self.model.training else 'eval'
@@ -1247,8 +1214,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             ), self.template.generate_context(), self.multi_turn_completion_length_context():
                 samples = self._infer_single_or_multi_turn(samples, self.request_config)
                 if mode == 'train':
-                    # In training mode, ensure the model is returned to train() mode after inference
-                    # This is necessary as transformers engines set the model to eval mode during generation
+                    # Transformers inference may leave the model in eval mode.
                     self.model.train()
 
         return samples
@@ -1317,11 +1283,8 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             return samples
 
         def prompt_key(sample):
-            # Messages only hold <image>/<video> placeholders, so the same question text
-            # over different media must not share a GRPO group. Prefer the dataset row id;
-            # otherwise fall back to media paths.
+            # Include the dataset row ID or media paths so identical text over different media forms separate groups.
             def media_identity(media):
-                # Videos may be nested frame lists; keep every path at any depth.
                 if isinstance(media, (list, tuple)):
                     return [media_identity(item) for item in media]
                 return media if isinstance(media, str) else (media.get('path') if isinstance(media, dict) else None)
@@ -1404,9 +1367,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
 
     def _colocate_rollout(self, samples: List[OnPolicySample], request_config: RequestConfig) -> List[RolloutOutput]:
         """Perform co-located rollout inference with TransformersEngine or vLLMEngine"""
-        # Convert samples to RolloutInferRequest at the engine boundary.
-        # Use samples2requests so include_extra (multi_turn_scheduler / vllm_server_pass_dataset)
-        # is honored consistently with the server path.
+        # Use samples2requests to honor include_extra consistently with the server path.
         requests = self.samples2requests(samples)
         if self.vllm_tensor_parallel_size > 1:
             local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
@@ -1502,16 +1463,13 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
 
     @torch.no_grad()
     def offload_model(self, model):
-        # FSDP2: simple .cpu() is sufficient
         if self._is_fsdp2:
             model.cpu()
             torch.cuda.empty_cache()
             return
 
-        # Default: iterate over parameters
         for param in model.parameters():
-            # After DeepSpeed distributed loading: param.data is empty and weights cannot be off-loaded.
-            # The real weights are stored in ds_tensor.
+            # DeepSpeed stores offloaded weights in ds_tensor and leaves param.data empty.
             if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
                 param.ds_tensor.data = param.ds_tensor.data.to('cpu', non_blocking=True)
             else:
@@ -1522,14 +1480,11 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
     def load_model(self, model):
         device = get_current_device()
 
-        # FSDP2: simple .to(device) is sufficient
         if self._is_fsdp2:
             model.to(device)
             return
 
-        # Default: iterate over parameters
         for param in model.parameters():
-            # Reverse logic of off-loading: move weights back to target device
             if is_deepspeed_enabled() and hasattr(param, 'ds_tensor'):
                 param.ds_tensor.data = param.ds_tensor.data.to(device, non_blocking=True)
             else:
@@ -1541,13 +1496,10 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             return
 
         if is_deepspeed_enabled():
-            # DeepSpeed optimizer: param_groups may be empty
             for _, state in self.optimizer.state.items():
-                # Iterate over a copy to avoid dict size change errors
                 for key, value in list(state.items()):
                     if not isinstance(value, torch.Tensor):
                         continue
-                    # Skip if already on CPU
                     if value.device.type == 'cpu':
                         continue
 
@@ -1559,7 +1511,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                     value.data = state[offload_key]
             return
 
-        # Original non-DeepSpeed logic
         for param_group in self.optimizer.param_groups:
             if not param_group.get('params'):
                 logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
@@ -1569,7 +1520,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                 state = self.optimizer.state.get(param)
                 if not state:
                     continue
-                for key, value in list(state.items()):  # Iterate over a list copy
+                for key, value in list(state.items()):
                     if isinstance(value, torch.Tensor) and value.device.type != 'cpu':
                         state[key] = value.to('cpu', non_blocking=True)
 
@@ -1591,7 +1542,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                         value.data = state[offload_key].to(device, non_blocking=True)
             return
 
-        # Original non-DeepSpeed logic
         for param_group in self.optimizer.param_groups:
             if not param_group.get('params'):
                 logger.warning("Empty param_group['params'] detected in non-DeepSpeed optimizer.")
@@ -1601,7 +1551,7 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
                 state = self.optimizer.state.get(param)
                 if not state:
                     continue
-                for key, value in list(state.items()):  # Iterate over a list copy
+                for key, value in list(state.items()):
                     if isinstance(value, torch.Tensor) and value.device.type == 'cpu':
                         state[key] = value.to(device, non_blocking=True)
 
@@ -1624,7 +1574,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
             return
 
         if args.multi_turn_scheduler:
-            # Get tokenizer for scheduler (needed in colocate mode where infer_engine may be None)
             tokenizer = getattr(self, 'processing_class', None)
             if isinstance(args.multi_turn_scheduler, str):
                 assert args.multi_turn_scheduler in multi_turns
@@ -1778,16 +1727,13 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         disable mechanism simple and robust - we only need to set world_size = 1.
         """
 
-        # Save original SP state
         origin_size = sequence_parallel.world_size
         origin_extra_kwargs = sequence_parallel.extra_kwargs.copy()
 
-        # Disable SP by setting world_size = 1
-        # All patched functions will check this and use original implementations
+        # Patched sequence-parallel functions use their original implementations when world_size=1.
         sequence_parallel.world_size = 1
         sequence_parallel.extra_kwargs = {}
 
-        # Also update template settings if provided
         original_padding_free = None
         original_sequence_parallel_size = None
         if template is not None:
@@ -1799,7 +1745,6 @@ class RolloutTrainerMixin(BaseRolloutTrainerMixin, RLHFTrainerMixin):
         try:
             yield
         finally:
-            # Restore SP state
             sequence_parallel.world_size = origin_size
             sequence_parallel.extra_kwargs = origin_extra_kwargs
 

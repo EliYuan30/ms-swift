@@ -60,8 +60,7 @@ def encode_gkd_samples(
     """
     student_encoded_list: List[Dict[str, Any]] = []
     teacher_encoded_list: List[Dict[str, Any]] = []
-    # Cannot use any() here because it short-circuits: build_teacher_view()
-    # must be called for ALL samples to populate teacher_messages on each.
+    # Visit every sample; build_teacher_view populates teacher_messages as a side effect.
     has_opsd = False
     for s in samples:
         if s.build_teacher_view():
@@ -101,11 +100,7 @@ def build_teacher_requests(samples: List[OnPolicySample], template: Optional[Tem
         teacher_messages = getattr(s, 'teacher_messages', None)
         messages = teacher_messages if teacher_messages else req.messages
         if template is not None and s.response_token_ids:
-            # Send the sampled response as raw token ids (token-in-token-out) so the teacher server
-            # forwards the *same* tokens the student sampled instead of re-tokenizing the decoded text.
-            # Re-tokenization can split the response into a different number of tokens, breaking the
-            # alignment the teacher KL relies on. Applies to both the on-policy prompt (GRPO/OPD-RL)
-            # and the OPSD teacher prompt (which shares the same response tokens).
+            # Send sampled response IDs unchanged; retokenizing text can break student/teacher alignment.
             loss_mask = s.response_loss_mask or None
             ctk = s.extra.get('chat_template_kwargs') or {}
             prefix_ids = get_response_prefix_ids(template, sample_enable_thinking=ctk.get('enable_thinking'))
@@ -242,8 +237,7 @@ def assemble_teacher_completion_logprobs(
                 flat_ixs = [ix[0] for ix in ixs]
                 cursor = len(flat_ixs)
                 selected_turns = []
-                # Match backwards so repeated token sequences in the user prompt cannot steal an
-                # assistant-turn match. Preserve chronological order when assembling the result.
+                # Match backward to avoid prompt matches, then restore chronological order.
                 for turn_index in range(len(token_turns) - 1, -1, -1):
                     tokens = token_turns[turn_index]
                     start = find_last_subsequence(flat_ixs, tokens, cursor)
@@ -292,13 +286,10 @@ def assemble_teacher_completion_logprobs(
                 lps, ixs = lps[:count], ixs[:count]
             assert len(lps) == count, (f'Teacher logp count {len(lps)} != sampled tokens {count}. The teacher server '
                                        'must use the same tokenizer as the student (token-in-token-out).')
-            # lps/ixs are per-position single-element lists ([[lp], ...]) -> [count, 1].
             out_lp[i, completion_indices] = torch.tensor(lps, dtype=torch.float32, device=device)
             out_ix[i, completion_indices] = torch.tensor(ixs, dtype=torch.long, device=device)
         except (ValueError, AssertionError) as exc:
-            # One malformed trajectory must not kill the run (2026-09-21 incident:
-            # step ~976/1000 crash on an unmatchable assistant turn). Zeros mean
-            # the sample contributes no teacher signal for this step.
+            # An unmatchable trajectory receives no teacher signal for this step.
             logger.warning(f'[teacher-align] skipping sample {i}: {exc}')
             continue
     return TeacherOutput(topk_logprobs=out_lp, topk_indices=out_ix)
@@ -377,8 +368,7 @@ def parse_teacher_model_server(val: Optional[str]) -> Optional[List[TeacherServe
     if not val.startswith('['):
         return [TeacherServerConfig(url=val, tags=[])]
 
-    # JSON list of teachers: reuse swift's shared JSON parser (repairs malformed JSON), matching
-    # how other JSON-valued args (e.g. model_kwargs) are parsed rather than a bespoke json.loads.
+    # Use the shared parser for JSON-valued arguments.
     configs_raw = json_parse_to_dict(val)
     if not isinstance(configs_raw, list):
         raise ValueError(f'teacher_model_server must be a JSON list of {{url, tags}}, got {type(configs_raw)}.')
@@ -394,8 +384,7 @@ def parse_teacher_model_server(val: Optional[str]) -> Optional[List[TeacherServe
         tags = c.get('tags', [])
         if not isinstance(tags, list):
             raise ValueError(f'teacher_model_server[{i}]: "tags" must be a list, got {type(tags)}.')
-        # get_tag returns str, so normalize tags to str for consistent matching (a numeric dataset
-        # name would otherwise never match the routing tag).
+        # get_tag returns strings, including for numeric dataset names.
         tags = [str(t) for t in tags]
         configs.append(TeacherServerConfig(url=url, tags=tags))
 
@@ -460,8 +449,7 @@ def fetch_teacher_parsed_by_routing(
         return [requests[i] for i in routing[t_idx]]
 
     def client_for(t_idx):
-        # teacher_clients is empty on non-main ranks (client is only used during infer on the main
-        # process); pass None there and let the fetcher resolve its default.
+        # Only the main rank owns teacher clients.
         return teacher_clients[t_idx] if t_idx < len(teacher_clients) else None
 
     parsed: List[Any] = [None] * len(requests)
@@ -471,9 +459,9 @@ def fetch_teacher_parsed_by_routing(
             parsed[s_idx] = subset[local_i]
 
     if gather_fn is not None:
-        # Phase A: gather every teacher's requests (serial collectives, same order on all ranks).
+        # Keep collective request gathering in the same teacher order on every rank.
         handles = [gather_fn(subset_requests(t_idx)) for t_idx in range(num_teachers)]
-        # Phase B: infer concurrently on the main process (HTTP to distinct teacher servers).
+        # Run independent teacher HTTP requests concurrently on the main rank.
         parsed_globals: List[Any] = [None] * num_teachers
         if is_main_process:
 
@@ -502,7 +490,7 @@ def fetch_teacher_parsed_by_routing(
                             parsed_globals[t] = []
                     for fut in futures:
                         parsed_globals[futures[fut]] = fut.result()
-        # Phase C: broadcast + slice each teacher's result back (serial collectives, rank-ordered).
+        # Broadcast and slice results in teacher order on every rank.
         for t_idx in range(num_teachers):
             scatter_back(t_idx, scatter_fn(handles[t_idx], parsed_globals[t_idx]))
         return parsed

@@ -39,7 +39,6 @@ class OnPolicySample:
     ``collate_to_grpo_micro_batch`` (returns ``(model_inputs, grpo_batch)``), never on
     the sample.
     """
-    # --- standard keys ---
     messages: List[Dict]
     images: List[Any] = field(default_factory=list)
     videos: List[Any] = field(default_factory=list)
@@ -48,11 +47,9 @@ class OnPolicySample:
     objects: Dict[str, Any] = field(default_factory=dict)
     extra: Dict[str, Any] = field(default_factory=dict)  # dataset passthrough columns (flattened for reward)
 
-    # --- id ---
     prompt_id: str = ''
     request_id: str = ''
 
-    # --- rollout output ---
     response_token_ids: List[List[int]] = field(default_factory=list)
     response_loss_mask: List[List[int]] = field(default_factory=list)
     rollout_logprobs: List[List[float]] = field(default_factory=list)
@@ -61,10 +58,8 @@ class OnPolicySample:
     rollout_infos: Dict[str, Any] = field(default_factory=dict)
     routed_experts: Optional[Any] = None  # R3 router replay (per-sample, pre-collation)
 
-    # --- per-sample template.encode output, used for model forward kwargs ---
     encoded: Optional[Dict[str, Any]] = None
 
-    # --- OPSD (On-Policy Self-Distillation), shared by GKD and OPD-RL ---
     teacher_prompt: Optional[Any] = None  # OPSD: dataset ``teacher_prompt`` column (pre-collation)
     teacher_messages: Optional[Messages] = None  # OPSD: messages with teacher_prompt replacing last user
 
@@ -118,8 +113,7 @@ class OnPolicySample:
             d['chat_template_kwargs'] = chat_template_kwargs
         if self.response_token_ids:
             d['response_token_ids'] = self.response_token_ids
-            # The mask must travel with the ids: it marks non-sampled spans (earlier turns,
-            # observations, a source-included response prefix) the teacher must not score.
+            # Carry the mask with IDs so teachers exclude all non-sampled spans.
             if self.response_loss_mask:
                 d['response_loss_mask'] = self.response_loss_mask
         d['add_eos'] = False
@@ -173,7 +167,7 @@ class OnPolicySample:
             if key in field_names:
                 standard[key] = copy.deepcopy(value)
             elif key == 'is_truncated':
-                continue  # derived from finish_reason
+                continue
             else:
                 extra[key] = copy.deepcopy(value)
         return cls(extra=extra, **standard)
@@ -208,15 +202,13 @@ class OnPolicySample:
         choice = rollout_output.response.choices[0]
         return_by_scheduler = rollout_output.messages is not None
 
-        # messages: multi-turn returns full history; single-turn appends response
         if return_by_scheduler:
             self.messages = rollout_output.messages
         else:
             remove_response(self.messages)
             self.messages.append({'role': 'assistant', 'content': choice.message.content})
 
-        # response token ids: prefer explicit TITO / scheduler output; only fall
-        # back to single-shot choice.token_ids in genuine single-turn rollout.
+        # Fall back to choice.token_ids only for single-turn rollouts.
         if rollout_output.response_token_ids:
             self.response_token_ids = rollout_output.response_token_ids
             if rollout_output.response_loss_mask:
@@ -224,25 +216,21 @@ class OnPolicySample:
         elif not return_by_scheduler and choice.token_ids:
             self.response_token_ids = choice.token_ids
 
-        # rollout logprobs (for importance sampling); keep nested [turn][token]
         if rollout_output.rollout_logprobs:
             self.rollout_logprobs = rollout_output.rollout_logprobs
         elif not return_by_scheduler and choice.logprobs is not None and 'content' in choice.logprobs:
             self.rollout_logprobs = [[item['logprob'] for item in choice.logprobs['content']]]
         else:
-            # Empty scheduler logprobs deliberately disable correction; the final
-            # choice's logprobs cannot substitute for a multi-turn trajectory.
+            # Empty scheduler logprobs disable correction; final-turn logprobs cannot replace the trajectory.
             self.rollout_logprobs = []
 
         self.finish_reason = choice.finish_reason
         self.add_eos = False
 
-        # R3 router replay: transfer routed_experts from the rollout choice
         routed_experts = getattr(choice, 'routed_experts', None)
         if routed_experts is not None:
             self.routed_experts = routed_experts
 
-        # rollout_infos may carry scheduler-overridden multi-modal data
         if rollout_output.rollout_infos:
             self.rollout_infos = rollout_output.rollout_infos
             for key in _MULTIMODAL_KEYS:
@@ -331,8 +319,7 @@ class GRPOBatch:
     rollout_per_token_logps: Optional[torch.Tensor] = None  # [B, T]
     teacher_per_token_logps: Optional[torch.Tensor] = None  # [B, T], OPD-RL teacher logp on sampled tokens
     branch_token_mask: Optional[torch.Tensor] = None  # [B, T], canonical branch tokens trained with NLL
-    # Exact active student token ids grouped by assistant turn. This includes
-    # template-owned boundaries and excludes loss-masked response prefixes.
+    # Active student IDs include template boundaries but exclude masked response prefixes.
     completion_turn_token_ids: Optional[List[List[List[int]]]] = None
     advantages: Optional[torch.Tensor] = None  # [B, T] per-token (base broadcast minus per-token teacher KL)
     num_items_in_batch: Optional[torch.Tensor] = None  # scalar

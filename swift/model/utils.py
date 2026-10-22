@@ -133,7 +133,7 @@ def use_submodel_func(model, submodel_name: str, func_list: Optional[List[str]] 
         if key == 'generate' and model.device != submodel.device:
             submodel.__class__.device = model.device
         if key == 'forward' and 'generate' in func_list:
-            setattr(submodel, key, MethodType(_get_new_func(key), submodel))  # fix device_map
+            setattr(submodel, key, MethodType(_get_new_func(key), submodel))
 
 
 class InitModelStrategy:
@@ -153,11 +153,9 @@ class InitModelStrategy:
             mean_abs = param.abs().mean()
             std = param.std()
 
-            # NaN or Inf
             if not torch.isfinite(mean_abs) or not torch.isfinite(std):
                 return True
 
-            # Use empirically safe threshold
             MAX_THRESHOLD = 1e7
             if mean_abs > MAX_THRESHOLD or std > MAX_THRESHOLD:
                 return True
@@ -269,7 +267,6 @@ def get_default_torch_dtype(torch_dtype: Optional[torch.dtype]):
         else:
             return torch.float16
     else:
-        # cpu
         return torch.float32
 
 
@@ -314,7 +311,6 @@ def save_checkpoint(model: Optional[PreTrainedModel],
             model.save_pretrained(output_dir, safe_serialization=safe_serialization, max_shard_size=max_shard_size)
         else:
             model.save_pretrained(output_dir, safe_serialization=safe_serialization)
-            # copy sentencetransformers files
             from swift.utils import copy_files_by_pattern
             copy_files_by_pattern(model.model_dir, output_dir, '*.py')
             copy_files_by_pattern(model.model_dir, output_dir, '*.json')
