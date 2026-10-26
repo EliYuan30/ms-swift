@@ -50,7 +50,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from swift.dataset import RowPreprocessor
 from swift.rewards import orms, rm_plugins
-from swift.rl_core.advantage import (apply_rlsd_reweight, center_rewards_within_masked_groups, compute_advantages,
+from swift.rl_core.advantage import (apply_rlsd_reweight, compute_advantages,
                                      compute_advantages_dynamic, compute_reward_metrics, compute_sdar_loss,
                                      compute_teacher_kl_per_token, compute_teacher_logratio, expand_advantage_to_per_token)
 from swift.rl_core.data import GRPOBatch, GRPOSample
@@ -427,7 +427,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if self._has_teacher and self.use_teacher_api:
             self._assemble_teacher_api_logps(samples, batch_encoded_inputs)
         total_advantages = self._compute_advantages(samples, self._rewards_per_func, batch_encoded_inputs)
-        total_route_advantages = self._decoupled_route_advantages
         if getattr(self.args, 'mask_positive_invalid_final_advantages', False) and self.model.training:
             if any(gather_object([any(item['grpo_batch'].teacher_per_token_logps is not None
                                       for item in batch_encoded_inputs)])):
@@ -450,21 +449,11 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             total_advantages, excluded = _exclude_infra_error_groups(
                 total_advantages, [prompt_id for prompt_id, _ in group_infos], [error for _, error in group_infos])
             self._metrics['train']['tools/infra_error_excluded_row_rate'].append(excluded.float().mean().item())
-            if total_route_advantages is not None:
-                total_route_advantages = torch.where(
-                    excluded.view(-1, *([1] * (total_route_advantages.dim() - 1))),
-                    torch.zeros_like(total_route_advantages), total_route_advantages)
 
         local_advantages = get_even_process_data(self, total_advantages)
-        local_route_advantages = (
-            get_even_process_data(self, total_route_advantages)
-            if total_route_advantages is not None
-            else [None] * len(samples)
-        )
-        assert len(local_advantages) == len(local_route_advantages) == len(samples)
-        for i, (advantage, route_advantage) in enumerate(zip(local_advantages, local_route_advantages)):
-            samples[i].advantages = advantage
-            samples[i].route_advantage = route_advantage
+        assert len(local_advantages) == len(samples)
+        for sample, advantage in zip(samples, local_advantages):
+            sample.advantages = advantage
         self._logs['advantages'].extend(total_advantages.tolist())
 
         gas_chunks = self.split_by_mini_batches(samples)
@@ -476,11 +465,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             device = self.accelerator.device
             grpo_batch: GRPOBatch = batch_encoded['grpo_batch']
             base_advantages = torch.stack([data.advantages.to(device) for data in batch])
-            route_advantages = None
-            if any(data.route_advantage is not None for data in batch):
-                if not all(data.route_advantage is not None for data in batch):
-                    raise ValueError('Decoupled route advantages are missing for part of a micro-batch.')
-                route_advantages = torch.stack([data.route_advantage.to(device) for data in batch])
             use_rlsd = (self.advantage_reweight == 'rlsd' and grpo_batch.teacher_per_token_logps is not None)
             use_sdar = (self.sdar_loss_coef > 0 and grpo_batch.teacher_per_token_logps is not None)
             if use_rlsd:
@@ -513,22 +497,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         clip = float(self.mopd_advantage_clip)
                         teacher_delta = teacher_delta.clamp(min=-clip, max=clip)
                     grpo_batch.advantages = grpo_batch.advantages + self.teacher_kl_coef * teacher_delta
-            if route_advantages is not None:
-                turn_boundaries = grpo_batch.completion_turn_token_ids or []
-                if len(turn_boundaries) != len(batch):
-                    raise ValueError(
-                        f'Expected {len(batch)} assistant-turn boundaries, got {len(turn_boundaries)}.')
-                first_turn_mask = torch.zeros_like(grpo_batch.completion_mask)
-                for row, turn_ids in enumerate(turn_boundaries):
-                    if not turn_ids:
-                        raise ValueError(f'Missing assistant-turn token boundaries for sample {row}.')
-                    completion_indices = grpo_batch.completion_mask[row].nonzero(as_tuple=True)[0]
-                    first_turn_length = len(turn_ids[0])
-                    first_turn_mask[row, completion_indices[:first_turn_length]] = 1
-                grpo_batch.advantages = (
-                    grpo_batch.advantages
-                    + route_advantages.unsqueeze(-1) * first_turn_mask
-                )
             if grpo_batch.branch_token_mask is not None:
                 grpo_batch.advantages = grpo_batch.advantages.masked_fill(grpo_batch.branch_token_mask, 0.0)
             if grpo_batch.teacher_per_token_logps is not None:
@@ -643,8 +611,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         reframe_scheduler = getattr(self.args, 'multi_turn_scheduler', None) in {
             'og_mopd', 'gd_grpo'
         }
-        if not reframe_scheduler and not any(
-                getattr(func, 'condition_within_tool_calls', False) for func in self.reward_funcs):
+        if not reframe_scheduler:
             return None
 
         from tool_rewards import (CROP_TOOL, SELECT_TOOL, bbox_area_ratio, gate_iou_threshold, parse_crop_boxes,
@@ -654,26 +621,10 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         for sample in samples:
             calls = (sample.rollout_infos or {}).get('tool_calls') or []
             metadata = parse_tool_metadata(sample.extra.get('tool_metadata'))
+            preferred_tool = metadata.get('preferred_tool')
             sampled_calls = [
                 call for call in calls
                 if call.get('sampled', not call.get('injected', False))
-            ]
-            expected_tools = {
-                step.get('name')
-                for step in metadata.get('canonical_tool_plan') or []
-                if step.get('name') in {CROP_TOOL, SELECT_TOOL}
-            }
-            preferred_tool = metadata.get('preferred_tool')
-            if not expected_tools and preferred_tool in {CROP_TOOL, SELECT_TOOL}:
-                expected_tools.add(preferred_tool)
-            evidence_supervised = metadata.get(
-                'evidence_sensitive', metadata.get('tool_applicable')) is True
-            evidence_calls = [
-                call for call in sampled_calls
-                if evidence_supervised
-                and not call.get('injected', False)
-                and call.get('success', True)
-                and call.get('name') in expected_tools
             ]
             natural_calls = [call for call in sampled_calls if not call.get('injected', False)]
             info = sample.rollout_infos or {}
@@ -711,49 +662,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'execution_failure_count': sum(not call.get('success', True) for call in calls),
                 'execution_infra_error_count': sum(bool(call.get('infra_error')) for call in calls),
                 'tool_call_count': len(sampled_calls),
-                'evidence_tool_call_count': len(evidence_calls),
                 'tool_applicable': metadata.get('tool_applicable'),
-                'tool_beneficial': metadata.get('tool_beneficial'),
-                'evidence_sensitive': metadata.get('evidence_sensitive'),
             })
         return gather_object(local_info)
-
-    def _condition_rewards_for_advantage(
-        self,
-        rewards_per_func: torch.Tensor,
-        reframe_info: Optional[List[Dict[str, Any]]],
-        num_generations: int,
-    ) -> Tuple[torch.Tensor, List[int]]:
-        conditional_indices = [
-            i for i, func in enumerate(self.reward_funcs)
-            if getattr(func, 'condition_within_tool_calls', False)
-        ]
-        if (
-            not conditional_indices
-            or reframe_info is None
-            or not self.model.training
-            or self.dynamic_num_samples
-            or num_generations <= 1
-        ):
-            return rewards_per_func, []
-
-        tool_mask = torch.tensor(
-            [info['evidence_tool_call_count'] > 0 for info in reframe_info],
-            dtype=torch.bool,
-            device=rewards_per_func.device,
-        )
-        if tool_mask.numel() != rewards_per_func.shape[0]:
-            raise ValueError('Gathered tool-call flags do not align with gathered rewards.')
-
-        conditioned = rewards_per_func.clone()
-        for index in conditional_indices:
-            conditioned[:, index] = center_rewards_within_masked_groups(
-                conditioned[:, index], tool_mask, num_generations)
-
-        group_tool_counts = tool_mask.view(-1, num_generations).sum(dim=1)
-        self._metrics['train']['routing/evidence_active_group_rate'].append(
-            (group_tool_counts > 1).float().mean().item())
-        return conditioned, conditional_indices
 
     def _log_reframe_routing_metrics(
         self,
@@ -804,14 +715,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 [info['tool_applicable'] is expected for info in reframe_info], dtype=torch.bool, device=device)
             if subset.any():
                 self._metrics[mode][f'routing/tool_rate/{label}'].append(tool_mask[subset].float().mean().item())
-
-        for field in ('tool_beneficial', 'evidence_sensitive'):
-            for label, expected in (('true', True), ('false', False), ('unknown', None)):
-                subset = torch.tensor(
-                    [info[field] is expected for info in reframe_info], dtype=torch.bool, device=device)
-                if subset.any():
-                    self._metrics[mode][f'routing/tool_rate/{field}/{label}'].append(
-                        tool_mask[subset].float().mean().item())
 
         eligible = sum(info['gate_eligible_count'] for info in reframe_info)
         replaced = sum(info['gate_replaced_count'] for info in reframe_info)
@@ -1009,24 +912,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         mode = 'train' if self.model.training else 'eval'
         num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
         reframe_info = self._gather_reframe_rollout_info(samples)
-        advantage_rewards_per_func, conditional_indices = self._condition_rewards_for_advantage(
-            rewards_per_func, reframe_info, num_generations)
-
-        advantage_reward_weights = self.reward_weights
-        route_advantage = None
-        if os.environ.get('REFRAME_DECOUPLE_ROUTE_ADVANTAGE', '0') == '1':
-            route_index = next(
-                (i for i, name in enumerate(self.reward_func_names) if name == 'ReframeRouteReward'), None)
-            if route_index is None:
-                raise ValueError(
-                    'REFRAME_DECOUPLE_ROUTE_ADVANTAGE=1 requires reframe_route in reward_funcs.')
-            advantage_reward_weights = self.reward_weights.clone()
-            advantage_reward_weights[route_index] = 0.0
-            route_advantage = torch.nan_to_num(
-                rewards_per_func[:, route_index], nan=0.0) * self.reward_weights[route_index]
-
-        self._decoupled_route_advantages = route_advantage
-
         # Standardize within (prompt, drop coin) groups to avoid comparing dropped trajectories
         # with easier retained-view peers. Subgroups smaller than two receive zero advantage.
         drop_group_flags = None
@@ -1047,8 +932,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if not self.dynamic_num_samples:
             advantages, weighted_rewards = compute_advantages(
-                rewards_per_func=advantage_rewards_per_func,
-                reward_weights=advantage_reward_weights,
+                rewards_per_func=rewards_per_func,
+                reward_weights=self.reward_weights,
                 num_generations=num_generations,
                 advantage_estimator=self.advantage_estimator,
                 scale_rewards=self.scale_rewards,
@@ -1066,13 +951,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 self._metrics[mode]['routing/drop_subgroup_singleton_rate'].append(
                     (member_counts < 2).float().mean().item())
 
-            if route_advantage is not None:
-                weighted_rewards = weighted_rewards + route_advantage
-                self._metrics[mode]['routing/uncentered_route_advantage_mean'].append(
-                    route_advantage.mean().item())
-                self._metrics[mode]['routing/uncentered_route_advantage_std'].append(
-                    route_advantage.std().item() if route_advantage.numel() > 1 else 0.0)
-
             reward_metrics = compute_reward_metrics(
                 rewards=weighted_rewards,
                 rewards_per_func=rewards_per_func,
@@ -1088,23 +966,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             for name in self.reward_func_names:
                 self._metrics[mode][f'rewards/{name}/mean'].append(reward_metrics.per_func_mean[name])
                 self._metrics[mode][f'rewards/{name}/std'].append(reward_metrics.per_func_std[name])
-            if conditional_indices:
-                raw_reward_metrics = compute_reward_metrics(
-                    rewards=rewards,
-                    rewards_per_func=rewards_per_func,
-                    reward_func_names=self.reward_func_names,
-                    num_generations=num_generations,
-                    scale_rewards=self.scale_rewards,
-                )
-                self._metrics[mode]['reward_raw'].append(raw_reward_metrics.reward_mean)
-                self._metrics[mode]['reward_raw_std'].append(raw_reward_metrics.reward_std)
-                for index in conditional_indices:
-                    name = self.reward_func_names[index]
-                    conditioned_col = advantage_rewards_per_func[:, index]
-                    self._metrics[mode][f'rewards/{name}/conditioned_mean'].append(
-                        torch.nanmean(conditioned_col).item())
-                    self._metrics[mode][f'rewards/{name}/conditioned_std'].append(
-                        nanstd(conditioned_col).item())
             self._log_reframe_routing_metrics(
                 reframe_info, rewards_per_func, advantages, num_generations)
             log_rewards_all(rewards_per_func)
@@ -1140,7 +1001,7 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             advantages, _ = compute_advantages_dynamic(
                 rewards_per_func=rewards_per_func,
-                reward_weights=advantage_reward_weights,
+                reward_weights=self.reward_weights,
                 prompt_ids=prompt_ids,
                 request_ids=request_ids,
                 advantage_estimator=self.advantage_estimator,
@@ -1150,12 +1011,6 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 kl_values=kl_values,
                 subgroup_flags=drop_group_flags,
             )
-
-            if route_advantage is not None:
-                self._metrics[mode]['routing/uncentered_route_advantage_mean'].append(
-                    route_advantage.mean().item())
-                self._metrics[mode]['routing/uncentered_route_advantage_std'].append(
-                    route_advantage.std().item() if route_advantage.numel() > 1 else 0.0)
 
             # Metrics are logged on request-deduplicated rewards.
             unique_indices = self._get_last_indices(request_ids)
